@@ -2,9 +2,11 @@
 
 #include "mlx/backend/cuda/quantized/quantized.h"
 #include "mlx/backend/cuda/device.h"
+#include "mlx/backend/cuda/gemms/cublas_gemm.h"
 #include "mlx/backend/cuda/quantized/qmm.h"
 #include "mlx/backend/cuda/quantized/qmv.h"
 #include "mlx/backend/cuda/quantized/quantized_utils.h"
+#include "mlx/backend/common/matmul.h"
 #include "mlx/fast_primitives.h"
 #include "mlx/primitives.h"
 
@@ -41,7 +43,58 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 
   if (transpose_ && biases && mode_ == QuantizationMode::Affine) {
-    cute_qmm(x, w, scales, *biases, out, bits_, group_size_, enc);
+    if (M > 64) {
+      // Large M (prefill): dequantize INT4→FP16, then cuBLAS GEMM.
+      // This avoids redundant per-tile dequantization in the fused kernel.
+
+      // 1. Allocate temporary FP16 weight buffer: w is (N, K_packed), dequant
+      //    produces (N, K) in out.dtype() (float16 or bfloat16).
+      array w_dequant(
+          {static_cast<int>(N), static_cast<int>(K)},
+          out.dtype(),
+          nullptr,
+          {});
+      w_dequant.set_data(
+          cu::malloc_async(N * K * size_of(out.dtype()), enc));
+      enc.add_temporary(w_dequant);
+
+      // 2. Dequantize weights: INT4 packed → FP16
+      affine_dequantize(
+          w, scales, *biases, w_dequant, group_size_, bits_, enc, s);
+
+      // 3. cuBLAS FP16 GEMM: out = x @ w_dequant^T
+      //    x is (M, K) row-major, w_dequant is (N, K) row-major
+      //    We need C(M,N) = A(M,K) * B(N,K)^T
+      auto [batch_shape, a_batch_strides, b_batch_strides] =
+          collapse_batches(x, w_dequant);
+
+      CublasGemm gemm(
+          enc.device(),
+          out.dtype(),
+          /* a_transposed */ false,
+          /* a_rows (M) */ static_cast<uint64_t>(M),
+          /* a_cols (K) */ static_cast<uint64_t>(K),
+          /* lda */ static_cast<int64_t>(K),
+          /* b_transposed */ true,
+          /* b_rows (K) */ static_cast<uint64_t>(K),
+          /* b_cols (N) */ static_cast<uint64_t>(N),
+          /* ldb */ static_cast<int64_t>(K),
+          /* batch_count */ static_cast<int32_t>(batch_shape.back()),
+          /* a_batch_stride */ a_batch_strides.back(),
+          /* b_batch_stride */ b_batch_strides.back());
+
+      gemm.run(
+          enc,
+          out,
+          x,
+          w_dequant,
+          batch_shape,
+          a_batch_strides,
+          b_batch_strides,
+          /* alpha */ 1.0f);
+    } else {
+      cute_qmm(x, w, scales, *biases, out, bits_, group_size_, enc);
+    }
     return;
   }
 
