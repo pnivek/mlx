@@ -44,7 +44,14 @@ namespace cute_gemm {
 
 using namespace cute;
 
-template <int PackFactor, typename ProblemShape, typename CtaTiler,
+// FP4 e2m1 lookup table (same as cuda_fp4.h __nv_fp4_e2m1::operator float())
+__device__ __constant__ float FP4_E2M1_LUT[16] = {
+    0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+   -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+};
+
+template <int PackFactor, bool UseMxScale,
+          typename ProblemShape, typename CtaTiler,
           typename Element, typename Quant,
           typename AStride, typename ASmemLayout, typename TiledCopyA,
           typename BStride, typename BSmemLayout, typename TiledCopyB,
@@ -167,23 +174,13 @@ __global__ void qmm_impl(
   } else {
     // ===== INT4 path: Optimized with shared memory staging + prefetch =====
     //
-    // Optimization strategy (3 fixes):
+    // This path handles both affine INT4 (UseMxScale=false) and
+    // MXFP4/NVFP4 (UseMxScale=true).
     //
-    // 1. SHARED MEMORY STAGING for packed B:
-    //    Instead of each thread independently loading from global memory,
-    //    all 128 threads cooperatively load packed bytes into a shared memory
-    //    buffer using coalesced uint32_t loads. Then each thread reads from
-    //    shared memory (bank-conflict-free) for nibble extraction.
-    //
-    // 2. SCALE/BIAS SHARED MEMORY STAGING:
-    //    Cooperative load of scale/bias into smem eliminates L2 contention
-    //    from 128 threads independently hitting the same cache lines.
-    //
-    // 3. PREFETCH PIPELINE:
-    //    Load next tile's packed bytes into smem staging buffer AFTER gemm's
-    //    data is in smem, overlapping the global memory loads with compute.
-    //    (Unlike INT8, we can't prefetch into registers since we need smem
-    //    staging for coalescing. Instead, we use double-buffered smem.)
+    // Key differences for MXFP4:
+    // - Scales are uint8 (FP8 e8m0), not Element (fp16/bf16)
+    // - No bias/zero-point
+    // - Dequant uses FP4 e2m1 LUT instead of int_val * scale + bias
 
     constexpr int BN = decltype(size<1>(cta_tiler))::value;  // 128
     constexpr int BK = decltype(size<2>(cta_tiler))::value;  // 64
@@ -199,45 +196,35 @@ __global__ void qmm_impl(
     const uint8_t* B_batch = reinterpret_cast<const uint8_t*>(B) + l_coord * N_val * Kp;
     int b_n_start = n_coord * BN;
 
-    const Element* S_batch = S + l_coord * N_val * groups_per_row;
-    const Element* Z_batch = Z + l_coord * N_val * groups_per_row;
+    // ---- Scale/bias pointers ----
+    // For MXFP4: S is actually uint8_t* (FP8 e8m0 scales), Z is unused (nullptr).
+    // For Affine: S and Z are Element* (fp16/bf16 scales and zero-points).
+    // We use reinterpret_cast at load time based on UseMxScale.
 
     // ---- Shared memory for scale/bias staging ----
     constexpr int GROUPS_PER_TILE = BK / GROUP_SIZE;
     constexpr int TOTAL_GROUPS = BN * GROUPS_PER_TILE;
-    __shared__ Element smemS[TOTAL_GROUPS];
-    __shared__ Element smemZ[TOTAL_GROUPS];
+
+    // For both modes, we stage float-converted scales in smem.
+    __shared__ float smemSf[TOTAL_GROUPS];
+
+    // For affine mode, we also need zero-points.
+    // For MXFP4 mode, this is unused but the compiler will optimize it away
+    // since the branch is constexpr.
+    __shared__ float smemZf[UseMxScale ? 1 : TOTAL_GROUPS];
 
     // ---- Shared memory for packed B staging ----
-    // BN * BKP bytes = 128 * 32 = 4096 bytes. Store as uint32_t for alignment.
     constexpr int TOTAL_PACKED_U32 = (BN * BKP) / 4;  // 1024
     __shared__ uint32_t smemBpacked[TOTAL_PACKED_U32];
 
     auto K_TILE_MAX = size<3>(tAgA);
 
     // ---- Helper: coalesced load of packed B tile into shared memory ----
-    // 128 threads cooperatively load TOTAL_PACKED_U32 uint32_t values.
-    // Each thread loads TOTAL_PACKED_U32/128 values with stride-128 pattern
-    // for perfect coalescing (consecutive threads → consecutive addresses).
-    //
-    // Memory layout: B is row-major, N rows of Kp bytes each.
-    // Tile covers rows [b_n_start, b_n_start+BN) and columns [k_tile*BKP, (k_tile+1)*BKP).
-    // We load into smemBpacked with the SAME row-major layout: row n has BKP bytes
-    // at smemBpacked[n * BKP/4 .. (n+1) * BKP/4 - 1].
-    //
-    // For coalescing: consecutive threads should access consecutive global addresses.
-    // B rows have stride Kp (which may be >> BKP), so we load row-by-row.
-    // With BKP/4 = 8 uint32_t per row and 128 threads, we process 128/8 = 16 rows
-    // per iteration. BN/16 = 8 iterations total.
     auto load_packed_tile_to_smem = [&](int k_tile) {
       int b_kp_start = k_tile * BKP;
       constexpr int BKP_U32 = BKP / 4;  // 8 uint32_t per row
-
-      // Thread mapping: thread_idx = n_local_offset * BKP_U32 + kp_u32
-      // where n_local_offset = thread_idx / BKP_U32, kp_u32 = thread_idx % BKP_U32
-      // This gives 128/8 = 16 rows per iteration, and BN/16 = 8 iterations.
-      constexpr int ROWS_PER_ITER = 128 / BKP_U32;  // 16
-      constexpr int NUM_ITERS = BN / ROWS_PER_ITER;  // 8
+      constexpr int ROWS_PER_ITER = 256 / BKP_U32;  // 32
+      constexpr int NUM_ITERS = BN / ROWS_PER_ITER;  // 4
 
       int kp_u32 = thread_idx % BKP_U32;
       int n_base = thread_idx / BKP_U32;
@@ -247,14 +234,6 @@ __global__ void qmm_impl(
         int n_local = n_base + iter * ROWS_PER_ITER;
         int n_global = b_n_start + n_local;
 
-        // Global memory load: 16 threads read consecutive uint32_t within same row
-        // → coalesced 64-byte transaction (16 threads * 4 bytes).
-        // With 8 such groups (for 8 different kp_u32 values... wait, no.)
-        // Actually: threads 0..7 have kp_u32=0..7 and n_base=0 (first 8 threads)
-        // threads 8..15 have kp_u32=0..7 and n_base=1
-        // So 8 consecutive threads (same n_base) read the full row → 32-byte transaction.
-        // Then next 8 threads read next row → another 32-byte transaction.
-        // That's still efficient: 128-byte sector utilization.
         uint32_t val = *reinterpret_cast<const uint32_t*>(
             B_batch + n_global * Kp + b_kp_start + kp_u32 * 4);
 
@@ -273,7 +252,9 @@ __global__ void qmm_impl(
       load_packed_tile_to_smem(k_tile);
 
       // Load scales for this tile.
-      {
+      if constexpr (UseMxScale) {
+        // MXFP4: scales are uint8_t (FP8 e8m0). Convert to float via ldexpf.
+        const uint8_t* S_batch_u8 = reinterpret_cast<const uint8_t*>(S) + l_coord * N_val * groups_per_row;
         int k_global_base = k_tile * BK;
         int g_base = k_global_base / GROUP_SIZE;
         for (int idx = thread_idx; idx < TOTAL_GROUPS; idx += blockDim.x) {
@@ -281,21 +262,30 @@ __global__ void qmm_impl(
           int g_local = idx % GROUPS_PER_TILE;
           int n_global = b_n_start + n_local;
           int g_global = g_base + g_local;
-          smemS[idx] = S_batch[n_global * groups_per_row + g_global];
-          smemZ[idx] = Z_batch[n_global * groups_per_row + g_global];
+          uint8_t scale_byte = S_batch_u8[n_global * groups_per_row + g_global];
+          smemSf[idx] = ldexpf(1.0f, static_cast<int>(scale_byte) - 127);
+        }
+      } else {
+        // Affine: scales and zero-points are Element type.
+        const Element* S_batch = S + l_coord * N_val * groups_per_row;
+        const Element* Z_batch = Z + l_coord * N_val * groups_per_row;
+        int k_global_base = k_tile * BK;
+        int g_base = k_global_base / GROUP_SIZE;
+        for (int idx = thread_idx; idx < TOTAL_GROUPS; idx += blockDim.x) {
+          int n_local = idx / GROUPS_PER_TILE;
+          int g_local = idx % GROUPS_PER_TILE;
+          int n_global = b_n_start + n_local;
+          int g_global = g_base + g_local;
+          smemSf[idx] = float(S_batch[n_global * groups_per_row + g_global]);
+          smemZf[idx] = float(Z_batch[n_global * groups_per_row + g_global]);
         }
       }
 
       __syncthreads();
 
-      // Phase 2: Each thread reads packed bytes from smem, extracts nibbles,
-      // dequantizes using scales from smem, and writes to sB.
-      // This replaces the scattered global memory reads with fast smem reads.
-      //
-      // Work distribution: same as load but now each thread processes its
-      // assigned elements and writes to sB.
+      // Phase 2: Dequantize packed bytes and write to sB.
       constexpr int BKP_U32 = BKP / 4;
-      constexpr int ROWS_PER_ITER = 128 / BKP_U32;
+      constexpr int ROWS_PER_ITER = 256 / BKP_U32;
       constexpr int NUM_ITERS = BN / ROWS_PER_ITER;
 
       int kp_u32 = thread_idx % BKP_U32;
@@ -309,26 +299,35 @@ __global__ void qmm_impl(
         CUTE_UNROLL
         for (int b = 0; b < 4; ++b) {
           uint8_t packed_byte = (packed4 >> (b * 8)) & 0xFF;
-          int kp_local = kp_u32 * 4 + b;  // packed byte index in tile row
+          int kp_local = kp_u32 * 4 + b;
 
-          int k_in_tile_lo = kp_local * 2;       // unpacked k index [0..BK-1]
+          int k_in_tile_lo = kp_local * 2;
           int k_in_tile_hi = kp_local * 2 + 1;
 
           int g_lo = k_in_tile_lo / GROUP_SIZE;
           int g_hi = k_in_tile_hi / GROUP_SIZE;
 
-          float s = float(smemS[n_local * GROUPS_PER_TILE + g_lo]);
-          float z = float(smemZ[n_local * GROUPS_PER_TILE + g_lo]);
+          float s = smemSf[n_local * GROUPS_PER_TILE + g_lo];
 
-          // Low nibble (bits 0-3).
-          sB(n_local, k_in_tile_lo) = Element(float(packed_byte & 0xF) * s + z);
+          if constexpr (UseMxScale) {
+            // MXFP4: FP4 e2m1 LUT dequant, no bias.
+            sB(n_local, k_in_tile_lo) = Element(FP4_E2M1_LUT[packed_byte & 0xF] * s);
 
-          // High nibble (bits 4-7).
-          if (g_hi != g_lo) {
-            s = float(smemS[n_local * GROUPS_PER_TILE + g_hi]);
-            z = float(smemZ[n_local * GROUPS_PER_TILE + g_hi]);
+            if (g_hi != g_lo) {
+              s = smemSf[n_local * GROUPS_PER_TILE + g_hi];
+            }
+            sB(n_local, k_in_tile_hi) = Element(FP4_E2M1_LUT[packed_byte >> 4] * s);
+          } else {
+            // Affine: int_val * scale + zero_point.
+            float z = smemZf[n_local * GROUPS_PER_TILE + g_lo];
+            sB(n_local, k_in_tile_lo) = Element(float(packed_byte & 0xF) * s + z);
+
+            if (g_hi != g_lo) {
+              s = smemSf[n_local * GROUPS_PER_TILE + g_hi];
+              z = smemZf[n_local * GROUPS_PER_TILE + g_hi];
+            }
+            sB(n_local, k_in_tile_hi) = Element(float(packed_byte >> 4) * s + z);
           }
-          sB(n_local, k_in_tile_hi) = Element(float(packed_byte >> 4) * s + z);
         }
       }
 
@@ -394,7 +393,32 @@ inline auto dispatch_mma(bool is_sm80, F&& f) {
                    Layout<Shape<_16,_8,_1>>{}));
 }
 
-template <int PackFactor, typename GroupSize, typename Element, typename Quant, typename F>
+// dispatch_mma for BM=32 (256 threads): 2x M replication
+template <typename Element, typename F>
+inline auto dispatch_mma_bm32(bool is_sm80, F&& f) {
+  if (is_sm80) {
+    if constexpr (std::is_same_v<Element, float>) {
+      f(make_tiled_mma(SM80_16x8x8_F32TF32TF32F32_TN{},
+                       Layout<Shape<_2,_4,_1>>{},
+                       Tile<_32,_32,_8>{}));
+      return;
+    } else if constexpr (std::is_same_v<Element, cute::half_t>) {
+      f(make_tiled_mma(SM80_16x8x16_F32F16F16F32_TN{},
+                       Layout<Shape<_2,_4,_1>>{},
+                       Tile<_32,_32,_16>{}));
+      return;
+    } else if constexpr (std::is_same_v<Element, cutlass::bfloat16_t>) {
+      f(make_tiled_mma(SM80_16x8x16_F32BF16BF16F32_TN{},
+                       Layout<Shape<_2,_4,_1>>{},
+                       Tile<_32,_32,_16>{}));
+      return;
+    }
+  }
+  f(make_tiled_mma(F32FMA<Element, Element>{},
+                   Layout<Shape<_32,_8,_1>>{}));
+}
+
+template <int PackFactor, bool UseMxScale, typename GroupSize, typename Element, typename Quant, typename F>
 void qmm(
     int m, int n, int k, int l,
     GroupSize group_size,
@@ -410,8 +434,6 @@ void qmm(
 
   // Define TN strides (mixed).
   auto dA = make_stride(k, Int<1>{}, m * k); // (dM,dK,dL)
-  // For INT4 (PackFactor=2): B has k/2 bytes per row.
-  // For INT8 (PackFactor=1): B has k bytes per row.
   int kp = k / PackFactor;
   auto dB = make_stride(kp, Int<1>{}, n * kp); // (dN,dKp,dL)
   auto dC = make_stride(n, Int<1>{}, m * n); // (dM,dN,dL)
@@ -421,48 +443,87 @@ void qmm(
       make_shape(n, make_shape(group_size, k / group_size), l),
       make_stride(k / group_size, make_stride(Int<0>{}, Int<1>{}), n * k / group_size));
 
-  // Define CTA tile sizes (static).
-  auto bM = Int<16>{};
+  // CTA tile sizes: INT4 uses BM=32 (256 threads), INT8 uses BM=16 (128 threads).
   auto bN = Int<128>{};
   auto bK = Int<max(64,group_size)>{};
-  auto cta_tiler = make_shape(bM, bN, bK); // (BLK_M,BLK_N,BLK_K)
 
-  TiledCopy copy_a = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, Element>{},
-                                     Layout<Shape<_16,_8>,Stride<_8,_1>>{},
-                                     Layout<Shape< _1,_8>>{});
-  TiledCopy copy_b = make_tiled_copy(Copy_Atom<UniversalCopy<uint32_t>, Quant>{},
-                                     Layout<Shape<_16,_8>,Stride<_8,_1>>{},
-                                     Layout<Shape<_1,Int<32/sizeof_bits<Quant>::value>>>{});
+  if constexpr (PackFactor == 2) {
+    // INT4: BM=32, 256 threads for faster cooperative dequant
+    auto bM = Int<32>{};
+    auto cta_tiler = make_shape(bM, bN, bK);
 
-  // Define the smem layouts (static).
-  dispatch_swizzle<Element, GroupSize>([&](auto swizzle) {
-    auto swizzle_atom = composition(swizzle,
-                                    Layout<Shape<_8,GroupSize>,
-                                           Stride<GroupSize,_1>>{});
-    auto sA_layout = tile_to_shape(swizzle_atom, make_shape(bM, bK));
-    auto sB_layout = tile_to_shape(swizzle_atom, make_shape(bN, bK));
+    TiledCopy copy_a = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, Element>{},
+                                       Layout<Shape<_32,_8>,Stride<_8,_1>>{},
+                                       Layout<Shape< _1,_8>>{});
+    TiledCopy copy_b = make_tiled_copy(Copy_Atom<UniversalCopy<uint32_t>, Quant>{},
+                                       Layout<Shape<_32,_8>,Stride<_8,_1>>{},
+                                       Layout<Shape<_1,Int<32/sizeof_bits<Quant>::value>>>{});
 
-    // Create tiled MMA.
-    dispatch_mma<Element>(is_sm80, [&](auto mma) {
-      // Launch kernel.
-      auto* kernel = &qmm_impl<
-          PackFactor,
-          decltype(prob_shape), decltype(cta_tiler),
-          Element, Quant,
-          decltype(dA), decltype(sA_layout), decltype(copy_a),
-          decltype(dB), decltype(sB_layout), decltype(copy_b),
-          decltype(S_layout), decltype(dC), decltype(mma)>;
-      dim3 num_blocks(size(ceil_div(m, bM)), size(ceil_div(n, bN)), l);
-      dim3 block_dims(size(mma));
-      void* args[] = {
-        &prob_shape, &cta_tiler,
-        &A, &dA, &sA_layout, &copy_a,
-        &B, &dB, &sB_layout, &copy_b,
-        &S, &Z, &S_layout,
-        &C, &dC, &mma};
-      launch_kernel(reinterpret_cast<void*>(kernel), num_blocks, block_dims, 0, args);
+    dispatch_swizzle<Element, GroupSize>([&](auto swizzle) {
+      auto swizzle_atom = composition(swizzle,
+                                      Layout<Shape<_8,GroupSize>,
+                                             Stride<GroupSize,_1>>{});
+      auto sA_layout = tile_to_shape(swizzle_atom, make_shape(bM, bK));
+      auto sB_layout = tile_to_shape(swizzle_atom, make_shape(bN, bK));
+
+      dispatch_mma_bm32<Element>(is_sm80, [&](auto mma) {
+        auto* kernel = &qmm_impl<
+            PackFactor, UseMxScale,
+            decltype(prob_shape), decltype(cta_tiler),
+            Element, Quant,
+            decltype(dA), decltype(sA_layout), decltype(copy_a),
+            decltype(dB), decltype(sB_layout), decltype(copy_b),
+            decltype(S_layout), decltype(dC), decltype(mma)>;
+        dim3 num_blocks(size(ceil_div(m, bM)), size(ceil_div(n, bN)), l);
+        dim3 block_dims(size(mma));
+        void* args[] = {
+          &prob_shape, &cta_tiler,
+          &A, &dA, &sA_layout, &copy_a,
+          &B, &dB, &sB_layout, &copy_b,
+          &S, &Z, &S_layout,
+          &C, &dC, &mma};
+        launch_kernel(reinterpret_cast<void*>(kernel), num_blocks, block_dims, 0, args);
+      });
     });
-  });
+  } else {
+    // INT8: BM=16, 128 threads (original config)
+    auto bM = Int<16>{};
+    auto cta_tiler = make_shape(bM, bN, bK);
+
+    TiledCopy copy_a = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, Element>{},
+                                       Layout<Shape<_16,_8>,Stride<_8,_1>>{},
+                                       Layout<Shape< _1,_8>>{});
+    TiledCopy copy_b = make_tiled_copy(Copy_Atom<UniversalCopy<uint32_t>, Quant>{},
+                                       Layout<Shape<_16,_8>,Stride<_8,_1>>{},
+                                       Layout<Shape<_1,Int<32/sizeof_bits<Quant>::value>>>{});
+
+    dispatch_swizzle<Element, GroupSize>([&](auto swizzle) {
+      auto swizzle_atom = composition(swizzle,
+                                      Layout<Shape<_8,GroupSize>,
+                                             Stride<GroupSize,_1>>{});
+      auto sA_layout = tile_to_shape(swizzle_atom, make_shape(bM, bK));
+      auto sB_layout = tile_to_shape(swizzle_atom, make_shape(bN, bK));
+
+      dispatch_mma<Element>(is_sm80, [&](auto mma) {
+        auto* kernel = &qmm_impl<
+            PackFactor, UseMxScale,
+            decltype(prob_shape), decltype(cta_tiler),
+            Element, Quant,
+            decltype(dA), decltype(sA_layout), decltype(copy_a),
+            decltype(dB), decltype(sB_layout), decltype(copy_b),
+            decltype(S_layout), decltype(dC), decltype(mma)>;
+        dim3 num_blocks(size(ceil_div(m, bM)), size(ceil_div(n, bN)), l);
+        dim3 block_dims(size(mma));
+        void* args[] = {
+          &prob_shape, &cta_tiler,
+          &A, &dA, &sA_layout, &copy_a,
+          &B, &dB, &sB_layout, &copy_b,
+          &S, &Z, &S_layout,
+          &C, &dC, &mma};
+        launch_kernel(reinterpret_cast<void*>(kernel), num_blocks, block_dims, 0, args);
+      });
+    });
+  }
 }
 
 } // namespace cute_gemm
@@ -488,8 +549,6 @@ inline void dispatch_element_types(Dtype dtype, const char* tag, F&& f) {
 
 template <typename F>
 inline void dispatch_quant_types(int bits, const char* tag, F&& f) {
-  // Both INT4 and INT8 use uint8_t as storage type.
-  // INT4 nibble extraction is handled in the kernel via PackFactor.
   if (bits == 4 || bits == 8) {
     f.template operator()<uint8_t>();
   } else {
@@ -556,7 +615,7 @@ void cute_qmm(
           encoder.set_input_array(scales);
           encoder.set_input_array(biases);
           encoder.set_output_array(out);
-          cute_gemm::qmm<PackFactor>(
+          cute_gemm::qmm<PackFactor, false>(
               m,
               n,
               k,
@@ -577,6 +636,68 @@ void cute_qmm(
                     kernel, num_blocks, block_dims, smem_bytes, args);
               });
         });
+      });
+    });
+  });
+}
+
+void cute_qmm_fp4(
+    const array& x,
+    const array& w,
+    const array& scales,
+    array& out,
+    int bits,
+    int group_size,
+    cu::CommandEncoder& encoder) {
+  const char* tag = "[quantized_matmul_fp4]";
+  int m = out.shape(-2);
+  int n = out.shape(-1);
+  int k = x.shape(-1);
+  int l = out.size() / (m * n);
+  if (n % 128 != 0) {
+    throw std::runtime_error(
+        fmt::format("[{0}] N must be multiples of 128.", tag));
+  }
+  if (k % 64 != 0) {
+    throw std::runtime_error(
+        fmt::format("[{0}] K must be multiples of 64.", tag));
+  }
+  if (bits != 4) {
+    throw std::runtime_error(
+        fmt::format("[{0}] Only 4-bit quantization supported for MXFP4.", tag));
+  }
+  dispatch_element_types(out.dtype(), tag, [&]<typename Element>() {
+    dispatch_quant_types(bits, tag, [&]<typename Quant>() {
+      dispatch_groups(group_size, tag, [&](auto group_size) {
+        constexpr int PackFactor = 2;  // Always 4-bit
+        encoder.set_input_array(x);
+        encoder.set_input_array(w);
+        encoder.set_input_array(scales);
+        encoder.set_output_array(out);
+        // For MXFP4, scales are uint8_t stored in the scales array.
+        // We pass the scales pointer as Element* (it will be reinterpreted
+        // as uint8_t* inside the kernel when UseMxScale=true).
+        // Z (bias) is nullptr since MXFP4 has no bias.
+        cute_gemm::qmm<PackFactor, true>(
+            m,
+            n,
+            k,
+            l,
+            group_size,
+            gpu_ptr<Element>(x),
+            gpu_ptr<Quant>(w),
+            gpu_ptr<Element>(scales),
+            static_cast<Element*>(nullptr),
+            gpu_ptr<Element>(out),
+            encoder.device().compute_capability_major() >= 8,
+            [&](auto* kernel,
+                dim3 num_blocks,
+                dim3 block_dims,
+                uint32_t smem_bytes,
+                void** args) {
+              encoder.add_kernel_node(
+                  kernel, num_blocks, block_dims, smem_bytes, args);
+            });
       });
     });
   });

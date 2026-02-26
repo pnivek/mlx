@@ -16,4 +16,13 @@ void cute_qmm(
     int group_size,
     cu::CommandEncoder& encoder);
 
+void cute_qmm_fp4(
+    const array& x,
+    const array& w,
+    const array& scales,
+    array& out,
+    int bits,
+    int group_size,
+    cu::CommandEncoder& encoder);
+
 } // namespace mlx::core
