@@ -2,6 +2,7 @@
 
 #include "mlx/backend/cuda/quantized/quantized.h"
 #include "mlx/backend/cuda/quantized/gather_qmm.h"
+#include "mlx/backend/cuda/quantized/gather_qmv.h"
 #include "mlx/backend/cuda/device.h"
 #include "mlx/backend/cuda/gemms/cublas_gemm.h"
 #include "mlx/backend/cuda/quantized/qmm.h"
@@ -148,6 +149,26 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   const array& lhs_indices = inputs[inputs.size() - 2];
   const array& rhs_indices = inputs[inputs.size() - 1];
 
+  int M = x.shape(-2);
+  int K = x.shape(-1);
+  int N = out.shape(-1);
+  int B = lhs_indices.size();
+
+  // Fused on-device path for FP modes during decode (small M, small B).
+  // Uses fp_gather_qmv which reads indices on-device — no host sync.
+  // B<=64 threshold: decode has B=num_experts_per_tok (e.g. 4), prefill has
+  // B=seq_len*num_experts which benefits from batched dequant+cuBLAS.
+  if (transpose_ && M <= 8 && B <= 64 && mode_ != QuantizationMode::Affine) {
+    // Make indices contiguous (MoE produces broadcast/strided 3D indices).
+    array lhs_flat = ensure_row_contiguous(lhs_indices, enc, s);
+    array rhs_flat = ensure_row_contiguous(rhs_indices, enc, s);
+    cu::fp_gather_qmv(
+        w, scales, x, lhs_flat, rhs_flat, out,
+        bits_, group_size_, M, N, K, B, enc);
+    return;
+  }
+
+  // Fallback: host-side grouping path for large M or affine mode.
   gather_qmm_gpu(
       x, w, scales, biases,
       lhs_indices, rhs_indices,
