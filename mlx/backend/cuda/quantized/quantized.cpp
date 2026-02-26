@@ -1,6 +1,7 @@
 // Copyright © 2025 Apple Inc.
 
 #include "mlx/backend/cuda/quantized/quantized.h"
+#include "mlx/backend/cuda/quantized/gather_qmm.h"
 #include "mlx/backend/cuda/device.h"
 #include "mlx/backend/cuda/gemms/cublas_gemm.h"
 #include "mlx/backend/cuda/quantized/qmm.h"
@@ -13,6 +14,57 @@
 #include <nvtx3/nvtx3.hpp>
 
 namespace mlx::core {
+
+// Helper: dequantize weights to FP16 and run cuBLAS GEMM.
+static void dequant_cublas_gemm(
+    const array& x,
+    const array& w_dequant,
+    array& out,
+    int M, int N, int K,
+    cu::CommandEncoder& enc) {
+  auto [batch_shape, a_batch_strides, b_batch_strides] =
+      collapse_batches(x, w_dequant);
+
+  CublasGemm gemm(
+      enc.device(),
+      out.dtype(),
+      /* a_transposed */ false,
+      /* a_rows (M) */ static_cast<uint64_t>(M),
+      /* a_cols (K) */ static_cast<uint64_t>(K),
+      /* lda */ static_cast<int64_t>(K),
+      /* b_transposed */ true,
+      /* b_rows (K) */ static_cast<uint64_t>(K),
+      /* b_cols (N) */ static_cast<uint64_t>(N),
+      /* ldb */ static_cast<int64_t>(K),
+      /* batch_count */ static_cast<int32_t>(batch_shape.back()),
+      /* a_batch_stride */ a_batch_strides.back(),
+      /* b_batch_stride */ b_batch_strides.back());
+
+  gemm.run(
+      enc,
+      out,
+      x,
+      w_dequant,
+      batch_shape,
+      a_batch_strides,
+      b_batch_strides,
+      /* alpha */ 1.0f);
+}
+
+// Helper: allocate temporary dequantized weight buffer.
+static array alloc_dequant_buffer(
+    int N, int K, Dtype dtype,
+    cu::CommandEncoder& enc) {
+  array w_dequant(
+      {static_cast<int>(N), static_cast<int>(K)},
+      dtype,
+      nullptr,
+      {});
+  w_dequant.set_data(
+      cu::malloc_async(N * K * size_of(dtype), enc));
+  enc.add_temporary(w_dequant);
+  return w_dequant;
+}
 
 void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   nvtx3::scoped_range r("QuantizedMatmul::eval_gpu");
@@ -37,68 +89,70 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   int M = non_batched ? x.size() / K : x.shape(-2);
   int N = out.shape(-1);
 
+  // CuTe kernel alignment requirements.
+  bool cute_aligned = (N % 128 == 0) && (K % 64 == 0);
+
+  // FP quantization modes (MXFP4, NVFP4, MXFP8): use QMV for small M.
   if (transpose_ && M <= 8 && mode_ != QuantizationMode::Affine) {
     fp_qmv(w, scales, x, out, bits_, group_size_, M, N, K, enc);
     return;
   }
 
-  if (transpose_ && biases && mode_ == QuantizationMode::Affine) {
-    if (M > 64) {
-      // Large M (prefill): dequantize INT4→FP16, then cuBLAS GEMM.
-      // This avoids redundant per-tile dequantization in the fused kernel.
-
-      // 1. Allocate temporary FP16 weight buffer: w is (N, K_packed), dequant
-      //    produces (N, K) in out.dtype() (float16 or bfloat16).
-      array w_dequant(
-          {static_cast<int>(N), static_cast<int>(K)},
-          out.dtype(),
-          nullptr,
-          {});
-      w_dequant.set_data(
-          cu::malloc_async(N * K * size_of(out.dtype()), enc));
-      enc.add_temporary(w_dequant);
-
-      // 2. Dequantize weights: INT4 packed → FP16
-      affine_dequantize(
-          w, scales, *biases, w_dequant, group_size_, bits_, enc, s);
-
-      // 3. cuBLAS FP16 GEMM: out = x @ w_dequant^T
-      //    x is (M, K) row-major, w_dequant is (N, K) row-major
-      //    We need C(M,N) = A(M,K) * B(N,K)^T
-      auto [batch_shape, a_batch_strides, b_batch_strides] =
-          collapse_batches(x, w_dequant);
-
-      CublasGemm gemm(
-          enc.device(),
-          out.dtype(),
-          /* a_transposed */ false,
-          /* a_rows (M) */ static_cast<uint64_t>(M),
-          /* a_cols (K) */ static_cast<uint64_t>(K),
-          /* lda */ static_cast<int64_t>(K),
-          /* b_transposed */ true,
-          /* b_rows (K) */ static_cast<uint64_t>(K),
-          /* b_cols (N) */ static_cast<uint64_t>(N),
-          /* ldb */ static_cast<int64_t>(K),
-          /* batch_count */ static_cast<int32_t>(batch_shape.back()),
-          /* a_batch_stride */ a_batch_strides.back(),
-          /* b_batch_stride */ b_batch_strides.back());
-
-      gemm.run(
-          enc,
-          out,
-          x,
-          w_dequant,
-          batch_shape,
-          a_batch_strides,
-          b_batch_strides,
-          /* alpha */ 1.0f);
+  // MXFP4 / NVFP4: CuTe kernel for small M (aligned), dequant+cuBLAS otherwise.
+  if (transpose_ && (mode_ == QuantizationMode::Mxfp4 || mode_ == QuantizationMode::Nvfp4)) {
+    if (cute_aligned && M <= 64) {
+      cute_qmm_fp4(x, w, scales, out, bits_, group_size_, enc);
     } else {
+      array w_dequant = alloc_dequant_buffer(N, K, out.dtype(), enc);
+      fp_dequantize(w, scales, w_dequant, group_size_, bits_, enc, s);
+      dequant_cublas_gemm(x, w_dequant, out, M, N, K, enc);
+    }
+    return;
+  }
+
+  // Affine quantization: CuTe kernel for small M (aligned), dequant+cuBLAS otherwise.
+  if (transpose_ && biases && mode_ == QuantizationMode::Affine) {
+    if (cute_aligned && M <= 64) {
       cute_qmm(x, w, scales, *biases, out, bits_, group_size_, enc);
+    } else {
+      array w_dequant = alloc_dequant_buffer(N, K, out.dtype(), enc);
+      affine_dequantize(w, scales, *biases, w_dequant, group_size_, bits_, enc, s);
+      dequant_cublas_gemm(x, w_dequant, out, M, N, K, enc);
     }
     return;
   }
 
   throw std::runtime_error("QMM NYI");
+}
+
+
+void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
+  nvtx3::scoped_range r("GatherQMM::eval_gpu");
+  auto& s = stream();
+  auto& d = cu::device(s.device);
+  auto& enc = d.get_command_encoder(s);
+
+  out.set_data(cu::malloc_async(out.nbytes(), enc));
+
+  array x = ensure_row_contiguous_matrix(inputs[0], enc, s);
+  array w = ensure_row_contiguous_matrix(inputs[1], enc, s);
+  array scales = ensure_row_contiguous_matrix(inputs[2], enc, s);
+  std::optional<array> biases = std::nullopt;
+
+  // Inputs layout: x, w, scales, [biases], lhs_indices, rhs_indices
+  // Affine mode has biases; FP modes do not.
+  if (mode_ == QuantizationMode::Affine) {
+    biases = ensure_row_contiguous_matrix(inputs[3], enc, s);
+  }
+
+  const array& lhs_indices = inputs[inputs.size() - 2];
+  const array& rhs_indices = inputs[inputs.size() - 1];
+
+  gather_qmm_gpu(
+      x, w, scales, biases,
+      lhs_indices, rhs_indices,
+      out, transpose_, group_size_, bits_, mode_,
+      enc, s);
 }
 
 void fast::Quantize::eval_gpu(
