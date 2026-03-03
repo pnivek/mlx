@@ -124,11 +124,11 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   // MXFP8: SM120 native > dequant+cuBLAS fallback.
   // SM120 uses m16n8k32 MMA with ue8m0 scale factors (TileShape K=128).
-  // M <= 8 already dispatched to QMV above. SM120 is faster than
-  // dequant+cuBLAS for small-to-moderate M; at large M the activation
-  // quantization overhead dominates and cuBLAS wins, so cap at M <= 512.
+  // M <= 8 already dispatched to QMV above. SM120 native beats
+  // dequant+cuBLAS up to ~M=2048 (avoids N*K FP16 dequant buffer +
+  // separate dequant kernel). At M>=4096 cuBLAS wins due to better tiling.
   if (transpose_ && mode_ == QuantizationMode::Mxfp8) {
-    if (d.compute_capability_major() >= 12 && (K % 128 == 0) && M <= 512) {
+    if (d.compute_capability_major() >= 12 && (K % 128 == 0) && M <= 2048) {
       cute_qmm_fp8_sm120(x, w, scales, out, group_size_, enc);
       return;
     }
