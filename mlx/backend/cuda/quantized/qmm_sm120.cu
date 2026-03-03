@@ -12,7 +12,7 @@
 //
 // For NVFP4: Uses m16n8k64 MMA with ue4m3 scale factors, SFVecSize=16.
 // For MXFP4: Uses m16n8k64 MMA with ue8m0 scale factors, SFVecSize=32.
-// For MXFP8: Uses m16n8k32 MMA with ue8m0 scale factors, SFVecSize=32.
+// For MXFP8: Uses m16n8k32 MMA with ue8m0 scale factors, SFVecSize=32, TileK=128.
 //
 // References:
 //   [1] CUTLASS Example 79a — blackwell_geforce_nvfp4_bf16_gemm
@@ -821,16 +821,20 @@ using MxFP4_FP16_Gemm = Sm120BlockScaledGemm<
     cutlass::mx_float4_t<cutlass::float_e2m1_t>,
     cutlass::half_t, 32, 32, Sm120FP4TileShape>;
 
-// Tile shape for SM120 FP8 GEMM: K=64 (half of FP4's K=128 since FP8 is 2x wider).
-using Sm120FP8TileShape = cute::Shape<cute::_128, cute::_128, cute::_64>;
+// Tile shape for SM120 FP8 GEMM: K=128 (same as FP4).
+// Despite FP8 being 2x wider per element, CUTLASS CollectiveBuilder expects
+// K=128 for block-scaled TMA layout compatibility (per CUTLASS example 79c).
+// The physical data per tile is 128 bytes (vs 64 bytes for FP4).
+using Sm120FP8TileShape = cute::Shape<cute::_128, cute::_128, cute::_128>;
 
 // MXFP8: mx_float8_t with ue8m0 scale factors, SFVecSize=32.
+// AlignA/B=16: 16 FP8 elements × 1 byte = 16 bytes (vs 32 FP4 × 0.5 bytes).
 using MxFP8_BF16_Gemm = Sm120BlockScaledGemm<
     cutlass::mx_float8_t<cutlass::float_e4m3_t>,
-    cutlass::bfloat16_t, 32, 32, Sm120FP8TileShape>;
+    cutlass::bfloat16_t, 16, 16, Sm120FP8TileShape>;
 using MxFP8_FP16_Gemm = Sm120BlockScaledGemm<
     cutlass::mx_float8_t<cutlass::float_e4m3_t>,
-    cutlass::half_t, 32, 32, Sm120FP8TileShape>;
+    cutlass::half_t, 16, 16, Sm120FP8TileShape>;
 
 // Non-template helper: configure kernel and return void* pointer.
 // Each variant is a separate non-template function to ensure consistent
@@ -1061,7 +1065,7 @@ void cute_qmm_fp4_sm120(
 // Public API: SM120 native FP8 quantized matmul (MXFP8).
 //
 // Uses mx_float8_t<float_e4m3_t> with ue8m0 scale factors, SFVecSize=32.
-// TileShape=128x128x64 (half K of FP4 since FP8 is 2x wider per element).
+// TileShape=128x128x128 (same K as FP4, per CUTLASS example 79c).
 // Activations are quantized on-the-fly to FP8 with per-block scale factors.
 // ============================================================================
 

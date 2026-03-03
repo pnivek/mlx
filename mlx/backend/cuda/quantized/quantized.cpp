@@ -123,10 +123,10 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 
   // MXFP8: SM120 native > dequant+cuBLAS fallback.
-  // SM120 uses m16n8k32 MMA with ue8m0 scale factors (TileShape K=64).
+  // SM120 uses m16n8k32 MMA with ue8m0 scale factors (TileShape K=128).
   // M <= 8 already dispatched to QMV above, so SM120 handles all M >= 9.
   if (transpose_ && mode_ == QuantizationMode::Mxfp8) {
-    if (d.compute_capability_major() >= 12 && (K % 64 == 0)) {
+    if (d.compute_capability_major() >= 12 && (K % 128 == 0)) {
       cute_qmm_fp8_sm120(x, w, scales, out, group_size_, enc);
       return;
     }
