@@ -78,7 +78,8 @@ template <
     typename ElementOut,
     int AlignA,
     int AlignB,
-    typename TileShape>
+    typename TileShape,
+    typename KernelScheduleTag = cutlass::gemm::collective::KernelScheduleAuto>
 struct Sm120BlockScaledGemm {
   // Both A (activation) and B (weight) use the same block-scaled type.
   using ElementA = ElementQuant;
@@ -126,7 +127,7 @@ struct Sm120BlockScaledGemm {
           TileShape, ClusterShape,
           cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
               sizeof(typename CollectiveEpilogue::SharedStorage))>,
-          cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+          KernelScheduleTag>::CollectiveOp;
 
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
       cute::Shape<int, int, int, int>, // ProblemShape: M, N, K, L
@@ -893,6 +894,38 @@ using MxFP8_FP16_Gemm = Sm120BlockScaledGemm<
     cutlass::mx_float8_t<cutlass::float_e4m3_t>,
     cutlass::half_t, 16, 16, Sm120FP8TileShape>;
 
+// Pingpong schedule variants for MXFP8.
+// Pingpong uses 4 warps (128 threads) with overlapped producer/consumer phases
+// instead of Cooperative's 8 warps (256 threads). Better latency hiding on LPDDR5x.
+using MxFP8_BF16_Gemm_PP = Sm120BlockScaledGemm<
+    cutlass::mx_float8_t<cutlass::float_e4m3_t>,
+    cutlass::bfloat16_t, 16, 16, Sm120FP8TileShape,
+    cutlass::gemm::KernelTmaWarpSpecializedPingpongMxf8f6f4Sm120>;
+using MxFP8_FP16_Gemm_PP = Sm120BlockScaledGemm<
+    cutlass::mx_float8_t<cutlass::float_e4m3_t>,
+    cutlass::half_t, 16, 16, Sm120FP8TileShape,
+    cutlass::gemm::KernelTmaWarpSpecializedPingpongMxf8f6f4Sm120>;
+
+// Pingpong schedule variants for NVFP4.
+using NvFP4_BF16_Gemm_PP = Sm120BlockScaledGemm<
+    cutlass::nv_float4_t<cutlass::float_e2m1_t>,
+    cutlass::bfloat16_t, 32, 32, Sm120FP4TileShape,
+    cutlass::gemm::KernelTmaWarpSpecializedPingpongNvf4Sm120>;
+using NvFP4_FP16_Gemm_PP = Sm120BlockScaledGemm<
+    cutlass::nv_float4_t<cutlass::float_e2m1_t>,
+    cutlass::half_t, 32, 32, Sm120FP4TileShape,
+    cutlass::gemm::KernelTmaWarpSpecializedPingpongNvf4Sm120>;
+
+// Pingpong schedule variants for MXFP4.
+using MxFP4_BF16_Gemm_PP = Sm120BlockScaledGemm<
+    cutlass::mx_float4_t<cutlass::float_e2m1_t>,
+    cutlass::bfloat16_t, 32, 32, Sm120FP4TileShape,
+    cutlass::gemm::KernelTmaWarpSpecializedPingpongMxf4Sm120>;
+using MxFP4_FP16_Gemm_PP = Sm120BlockScaledGemm<
+    cutlass::mx_float4_t<cutlass::float_e2m1_t>,
+    cutlass::half_t, 32, 32, Sm120FP4TileShape,
+    cutlass::gemm::KernelTmaWarpSpecializedPingpongMxf4Sm120>;
+
 // Non-template helper: configure kernel and return void* pointer.
 // Each variant is a separate non-template function to ensure consistent
 // type resolution between nvcc's device and host compilation passes.
@@ -992,6 +1025,103 @@ static void* get_configured_kernel_mxfp8_fp16() {
   return ptr;
 }
 
+// Pingpong schedule kernel configurators.
+static void* get_configured_kernel_mxfp8_bf16_pp() {
+  using GemmKernel = MxFP8_BF16_Gemm_PP::Gemm::GemmKernel;
+  void* ptr = (void*)sm120_gemm_kernel<GemmKernel>;
+  int smem = GemmKernel::SharedStorageSize;
+  if (smem >= (48 << 10)) {
+    cudaError_t err = cudaFuncSetAttribute(
+        ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(fmt::format(
+          "[qmm_sm120] cudaFuncSetAttribute failed for mxfp8_bf16_pp: {} (smem={}B)",
+          cudaGetErrorString(err), smem));
+    }
+  }
+  return ptr;
+}
+
+static void* get_configured_kernel_mxfp8_fp16_pp() {
+  using GemmKernel = MxFP8_FP16_Gemm_PP::Gemm::GemmKernel;
+  void* ptr = (void*)sm120_gemm_kernel<GemmKernel>;
+  int smem = GemmKernel::SharedStorageSize;
+  if (smem >= (48 << 10)) {
+    cudaError_t err = cudaFuncSetAttribute(
+        ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(fmt::format(
+          "[qmm_sm120] cudaFuncSetAttribute failed for mxfp8_fp16_pp: {} (smem={}B)",
+          cudaGetErrorString(err), smem));
+    }
+  }
+  return ptr;
+}
+
+static void* get_configured_kernel_nvfp4_bf16_pp() {
+  using GemmKernel = NvFP4_BF16_Gemm_PP::Gemm::GemmKernel;
+  void* ptr = (void*)sm120_gemm_kernel<GemmKernel>;
+  int smem = GemmKernel::SharedStorageSize;
+  if (smem >= (48 << 10)) {
+    cudaError_t err = cudaFuncSetAttribute(
+        ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(fmt::format(
+          "[qmm_sm120] cudaFuncSetAttribute failed for nvfp4_bf16_pp: {} (smem={}B)",
+          cudaGetErrorString(err), smem));
+    }
+  }
+  return ptr;
+}
+
+static void* get_configured_kernel_nvfp4_fp16_pp() {
+  using GemmKernel = NvFP4_FP16_Gemm_PP::Gemm::GemmKernel;
+  void* ptr = (void*)sm120_gemm_kernel<GemmKernel>;
+  int smem = GemmKernel::SharedStorageSize;
+  if (smem >= (48 << 10)) {
+    cudaError_t err = cudaFuncSetAttribute(
+        ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(fmt::format(
+          "[qmm_sm120] cudaFuncSetAttribute failed for nvfp4_fp16_pp: {} (smem={}B)",
+          cudaGetErrorString(err), smem));
+    }
+  }
+  return ptr;
+}
+
+static void* get_configured_kernel_mxfp4_bf16_pp() {
+  using GemmKernel = MxFP4_BF16_Gemm_PP::Gemm::GemmKernel;
+  void* ptr = (void*)sm120_gemm_kernel<GemmKernel>;
+  int smem = GemmKernel::SharedStorageSize;
+  if (smem >= (48 << 10)) {
+    cudaError_t err = cudaFuncSetAttribute(
+        ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(fmt::format(
+          "[qmm_sm120] cudaFuncSetAttribute failed for mxfp4_bf16_pp: {} (smem={}B)",
+          cudaGetErrorString(err), smem));
+    }
+  }
+  return ptr;
+}
+
+static void* get_configured_kernel_mxfp4_fp16_pp() {
+  using GemmKernel = MxFP4_FP16_Gemm_PP::Gemm::GemmKernel;
+  void* ptr = (void*)sm120_gemm_kernel<GemmKernel>;
+  int smem = GemmKernel::SharedStorageSize;
+  if (smem >= (48 << 10)) {
+    cudaError_t err = cudaFuncSetAttribute(
+        ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(fmt::format(
+          "[qmm_sm120] cudaFuncSetAttribute failed for mxfp4_fp16_pp: {} (smem={}B)",
+          cudaGetErrorString(err), smem));
+    }
+  }
+  return ptr;
+}
+
 // Helper: dispatch to the correct execute_sm120_fp4_gemm variant based on
 // group_size and output dtype.
 static void dispatch_sm120_fp4(
@@ -1006,12 +1136,12 @@ static void dispatch_sm120_fp4(
   if (group_size == 16) {
     // NVFP4: nv_float4_t with ue4m3 scale factors, SFVecSize=16.
     if (out.dtype() == bfloat16) {
-      void* kernel_ptr = get_configured_kernel_nvfp4_bf16();
-      execute_sm120_fp4_gemm<NvFP4_BF16_Gemm, __nv_bfloat16>(
+      void* kernel_ptr = get_configured_kernel_nvfp4_bf16_pp();
+      execute_sm120_fp4_gemm<NvFP4_BF16_Gemm_PP, __nv_bfloat16>(
           kernel_ptr, x, w, scales, out, group_size, encoder);
     } else if (out.dtype() == float16) {
-      void* kernel_ptr = get_configured_kernel_nvfp4_fp16();
-      execute_sm120_fp4_gemm<NvFP4_FP16_Gemm, __half>(
+      void* kernel_ptr = get_configured_kernel_nvfp4_fp16_pp();
+      execute_sm120_fp4_gemm<NvFP4_FP16_Gemm_PP, __half>(
           kernel_ptr, x, w, scales, out, group_size, encoder);
     } else {
       throw std::runtime_error(
@@ -1020,12 +1150,12 @@ static void dispatch_sm120_fp4(
   } else if (group_size == 32) {
     // MXFP4: mx_float4_t with ue8m0 scale factors, SFVecSize=32.
     if (out.dtype() == bfloat16) {
-      void* kernel_ptr = get_configured_kernel_mxfp4_bf16();
-      execute_sm120_fp4_gemm<MxFP4_BF16_Gemm, __nv_bfloat16>(
+      void* kernel_ptr = get_configured_kernel_mxfp4_bf16_pp();
+      execute_sm120_fp4_gemm<MxFP4_BF16_Gemm_PP, __nv_bfloat16>(
           kernel_ptr, x, w, scales, out, group_size, encoder);
     } else if (out.dtype() == float16) {
-      void* kernel_ptr = get_configured_kernel_mxfp4_fp16();
-      execute_sm120_fp4_gemm<MxFP4_FP16_Gemm, __half>(
+      void* kernel_ptr = get_configured_kernel_mxfp4_fp16_pp();
+      execute_sm120_fp4_gemm<MxFP4_FP16_Gemm_PP, __half>(
           kernel_ptr, x, w, scales, out, group_size, encoder);
     } else {
       throw std::runtime_error(
@@ -1137,12 +1267,12 @@ static void dispatch_sm120_fp8(
   const char* tag = "[qmm_fp8_sm120]";
 
   if (out.dtype() == bfloat16) {
-    void* kernel_ptr = get_configured_kernel_mxfp8_bf16();
-    execute_sm120_fp8_gemm<MxFP8_BF16_Gemm, __nv_bfloat16>(
+    void* kernel_ptr = get_configured_kernel_mxfp8_bf16_pp();
+    execute_sm120_fp8_gemm<MxFP8_BF16_Gemm_PP, __nv_bfloat16>(
         kernel_ptr, x, w, scales, out, group_size, encoder);
   } else if (out.dtype() == float16) {
-    void* kernel_ptr = get_configured_kernel_mxfp8_fp16();
-    execute_sm120_fp8_gemm<MxFP8_FP16_Gemm, __half>(
+    void* kernel_ptr = get_configured_kernel_mxfp8_fp16_pp();
+    execute_sm120_fp8_gemm<MxFP8_FP16_Gemm_PP, __half>(
         kernel_ptr, x, w, scales, out, group_size, encoder);
   } else {
     throw std::runtime_error(
