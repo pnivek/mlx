@@ -198,6 +198,131 @@ __global__ void fp_qmv_batched(
       mat, scales, vec, out, rows, cols);
 }
 
+// Persistent QMV kernel: each block processes a contiguous range of rows.
+// Uses shared memory for the activation vector to eliminate L2 contention
+// and ensure sequential DRAM access (one block per SM).
+// Grid: {M, num_sms}. Each block handles ceil(N / num_sms) rows.
+template <
+    typename T,
+    int rows_per_block,
+    int n_per_thread,
+    int bits,
+    int group_size,
+    bool use_mx_scale>
+__global__ void fp_qmv_persistent(
+    const uint32_t* __restrict__ mat,
+    const uint8_t* __restrict__ scales_,
+    const T* __restrict__ vec,
+    T* __restrict__ out,
+    int rows,
+    int cols) {
+  extern __shared__ char smem[];
+  T* vec_s = reinterpret_cast<T*>(smem);
+
+  auto block = cg::this_thread_block();
+  auto warp = cg::tiled_partition<WARP_SIZE>(block);
+  auto g_idx = block.group_index();
+  auto t_idx = block.thread_index();
+
+  // Handle M dimension (blockIdx.x selects input/output vector)
+  vec += g_idx.x * cols;
+  out += g_idx.x * rows;
+
+  // Cooperatively load activation vector into shared memory
+  const int tid = t_idx.y * WARP_SIZE + t_idx.x;
+  const int block_size = WARP_SIZE * rows_per_block;
+  for (int i = tid; i < cols; i += block_size) {
+    vec_s[i] = vec[i];
+  }
+  __syncthreads();
+
+  // Compute contiguous row range for this block
+  const int num_blocks = gridDim.y;
+  const int block_id = g_idx.y;
+  const int total_chunks = (rows + rows_per_block - 1) / rows_per_block;
+  const int chunks_per_block =
+      (total_chunks + num_blocks - 1) / num_blocks;
+  const int chunk_start = block_id * chunks_per_block;
+  const int chunk_end = min(chunk_start + chunks_per_block, total_chunks);
+
+  constexpr int vals_per_item = bits == 8 ? 4 : 8;
+  constexpr int nv_per_thread = vals_per_item * n_per_thread;
+  const int packed_cols = cols / vals_per_item;
+
+  using ScaleType =
+      std::conditional_t<use_mx_scale, __nv_fp8_e8m0, __nv_fp8_e4m3>;
+  auto scales = (const ScaleType*)(scales_);
+
+  constexpr int scales_per_step = std::max(nv_per_thread / group_size, 1);
+  constexpr int scale_step = (WARP_SIZE * nv_per_thread) / group_size;
+  constexpr int n_per_step = n_per_thread / scales_per_step;
+
+  // Process chunks of rows_per_block rows sequentially
+  for (int chunk = chunk_start; chunk < chunk_end; ++chunk) {
+    int row = chunk * rows_per_block + t_idx.y;
+    if (row < rows) {
+      auto row_scales = scales + row * (cols / group_size) +
+          (warp.thread_rank() * nv_per_thread) / group_size;
+      float sum = 0.0f;
+
+      for (int col = n_per_thread * warp.thread_rank(); col < packed_cols;
+           col += (WARP_SIZE * n_per_thread)) {
+        // Read activation from shared memory instead of global
+        auto local_vec =
+            unsafe_load_vector<nv_per_thread>(vec_s + vals_per_item * col, 0);
+        auto local_mat = unsafe_load_vector<n_per_thread>(
+            mat + row * packed_cols + col, 0);
+#pragma unroll
+        for (int i = 0; i < scales_per_step; ++i) {
+          float2 local_sum = {0.0f, 0.0f};
+#pragma unroll
+          for (int j = 0; j < n_per_step; ++j) {
+            int k = n_per_step * i + j;
+            if constexpr (bits == 8) {
+              auto v = dequant_fp8(local_mat[k]);
+              local_sum.x +=
+                  v.x * static_cast<float>(local_vec[vals_per_item * k]);
+              local_sum.x +=
+                  v.y * static_cast<float>(local_vec[vals_per_item * k + 1]);
+              local_sum.y +=
+                  v.z * static_cast<float>(local_vec[vals_per_item * k + 2]);
+              local_sum.y +=
+                  v.w * static_cast<float>(local_vec[vals_per_item * k + 3]);
+            } else {
+              auto v = dequant_fp4(local_mat[k]);
+              local_sum.x +=
+                  v.x * static_cast<float>(local_vec[vals_per_item * k]);
+              local_sum.y +=
+                  v.y * static_cast<float>(local_vec[vals_per_item * k + 1]);
+              local_sum.x +=
+                  v.z * static_cast<float>(local_vec[vals_per_item * k + 2]);
+              local_sum.y +=
+                  v.w * static_cast<float>(local_vec[vals_per_item * k + 3]);
+
+              v = dequant_fp4(local_mat[k] >> 16);
+              local_sum.x +=
+                  v.x * static_cast<float>(local_vec[vals_per_item * k + 4]);
+              local_sum.y +=
+                  v.y * static_cast<float>(local_vec[vals_per_item * k + 5]);
+              local_sum.x +=
+                  v.z * static_cast<float>(local_vec[vals_per_item * k + 6]);
+              local_sum.y +=
+                  v.w * static_cast<float>(local_vec[vals_per_item * k + 7]);
+            }
+          }
+          sum += (local_sum.x + local_sum.y) * float(row_scales[i]);
+        }
+        row_scales += scale_step;
+      }
+
+      sum = cg::reduce(warp, sum, cg::plus<float>{});
+      if (warp.thread_rank() == 0) {
+        out[row] = static_cast<T>(sum);
+      }
+    }
+  }
+}
+
 template <typename F>
 void dispatch_1_2_4(int n, F&& f) {
   switch (n) {
@@ -250,39 +375,91 @@ void fp_qmv(
       dispatch_1_2_4(n, [&](auto n) {
         dispatch_bool(B > 1, [&](auto batched) {
           if (!batched.value) {
-            auto kernel =
-                fp_qmv_single<T, rows_per_block, n.value, 4, 32, true>;
-            if (bits == 8) {
-              // FP8 path: dispatch by group_size within bits=8.
-              if (group_size == 64) {
-                kernel = fp_qmv_single<T, rows_per_block, n.value, 8, 64, true>;
-              } else if (group_size == 128) {
-                kernel = fp_qmv_single<T, rows_per_block, n.value, 8, 128, true>;
-              } else { // gs=32 (default for MXFP8)
-                kernel = fp_qmv_single<T, rows_per_block, n.value, 8, 32, true>;
+            // Persistent QMV for M=1: shared memory activation + contiguous
+            // row assignment per SM for sequential DRAM access.
+            if (M == 1 && K * int(sizeof(T)) <= 98304) {
+              static int num_sms = 0;
+              if (num_sms == 0) {
+                int dev;
+                cudaGetDevice(&dev);
+                cudaDeviceGetAttribute(
+                    &num_sms, cudaDevAttrMultiProcessorCount, dev);
               }
+              uint32_t smem_bytes = K * sizeof(T);
+              auto kernel = fp_qmv_persistent<
+                  T, rows_per_block, n.value, 4, 32, true>;
+              if (bits == 8) {
+                if (group_size == 64) {
+                  kernel = fp_qmv_persistent<
+                      T, rows_per_block, n.value, 8, 64, true>;
+                } else if (group_size == 128) {
+                  kernel = fp_qmv_persistent<
+                      T, rows_per_block, n.value, 8, 128, true>;
+                } else {
+                  kernel = fp_qmv_persistent<
+                      T, rows_per_block, n.value, 8, 32, true>;
+                }
+              } else {
+                if (group_size == 64) {
+                  kernel = fp_qmv_persistent<
+                      T, rows_per_block, n.value, 4, 64, true>;
+                } else if (group_size == 128) {
+                  kernel = fp_qmv_persistent<
+                      T, rows_per_block, n.value, 4, 128, true>;
+                } else if (group_size == 16) {
+                  kernel = fp_qmv_persistent<
+                      T, rows_per_block, n.value, 4, 16, false>;
+                }
+              }
+              encoder.add_kernel_node(
+                  kernel,
+                  {1u, static_cast<uint32_t>(num_sms)},
+                  block_dims,
+                  smem_bytes,
+                  mat_ptr,
+                  gpu_ptr<uint8_t>(scales),
+                  vec_ptr,
+                  gpu_ptr<T>(out),
+                  N,
+                  K);
             } else {
-              // FP4 path: dispatch by group_size within bits=4.
-              if (group_size == 64) {
-                kernel = fp_qmv_single<T, rows_per_block, n.value, 4, 64, true>;
-              } else if (group_size == 128) {
-                kernel = fp_qmv_single<T, rows_per_block, n.value, 4, 128, true>;
-              } else if (group_size == 16) {
-                kernel = fp_qmv_single<T, rows_per_block, n.value, 4, 16, false>;
+              auto kernel =
+                  fp_qmv_single<T, rows_per_block, n.value, 4, 32, true>;
+              if (bits == 8) {
+                if (group_size == 64) {
+                  kernel =
+                      fp_qmv_single<T, rows_per_block, n.value, 8, 64, true>;
+                } else if (group_size == 128) {
+                  kernel =
+                      fp_qmv_single<T, rows_per_block, n.value, 8, 128, true>;
+                } else {
+                  kernel =
+                      fp_qmv_single<T, rows_per_block, n.value, 8, 32, true>;
+                }
+              } else {
+                if (group_size == 64) {
+                  kernel =
+                      fp_qmv_single<T, rows_per_block, n.value, 4, 64, true>;
+                } else if (group_size == 128) {
+                  kernel =
+                      fp_qmv_single<T, rows_per_block, n.value, 4, 128, true>;
+                } else if (group_size == 16) {
+                  kernel =
+                      fp_qmv_single<T, rows_per_block, n.value, 4, 16, false>;
+                }
               }
-              // else: gs=32 default
+              encoder.add_kernel_node(
+                  kernel,
+                  {static_cast<uint32_t>(M), blocks_y},
+                  block_dims,
+                  0,
+                  mat_ptr,
+                  gpu_ptr<uint8_t>(scales),
+                  vec_ptr,
+                  gpu_ptr<T>(out),
+                  N,
+                  K);
             }
-            encoder.add_kernel_node(
-                kernel,
-                {static_cast<uint32_t>(M), blocks_y},
-                block_dims,
-                0,
-                mat_ptr,
-                gpu_ptr<uint8_t>(scales),
-                vec_ptr,
-                gpu_ptr<T>(out),
-                N,
-                K);
           } else {
             auto kernel =
                 fp_qmv_batched<T, rows_per_block, n.value, 4, 32, true>;
