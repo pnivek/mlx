@@ -277,7 +277,8 @@ __global__ void quantize_activation_fp4_kernel(
   float abs_val = fabsf(__half2float(val));
 
   // Warp shuffle amax reduction within sub-group.
-  unsigned sub_mask = ((1u << SF_VEC_SIZE) - 1) << (sub_group * SF_VEC_SIZE);
+  unsigned sub_mask = (SF_VEC_SIZE == 32) ? 0xffffffffu
+      : (((1u << SF_VEC_SIZE) - 1) << (sub_group * SF_VEC_SIZE));
   #pragma unroll
   for (int offset = SF_VEC_SIZE / 2; offset > 0; offset >>= 1) {
     abs_val = fmaxf(abs_val, __shfl_xor_sync(sub_mask, abs_val, offset));
@@ -330,7 +331,8 @@ __global__ void quantize_activation_fp4_bf16_kernel(
   __nv_bfloat16 val = input[m * K + g * SF_VEC_SIZE + local_lane];
   float abs_val = fabsf(__bfloat162float(val));
 
-  unsigned sub_mask = ((1u << SF_VEC_SIZE) - 1) << (sub_group * SF_VEC_SIZE);
+  unsigned sub_mask = (SF_VEC_SIZE == 32) ? 0xffffffffu
+      : (((1u << SF_VEC_SIZE) - 1) << (sub_group * SF_VEC_SIZE));
   #pragma unroll
   for (int offset = SF_VEC_SIZE / 2; offset > 0; offset >>= 1) {
     abs_val = fmaxf(abs_val, __shfl_xor_sync(sub_mask, abs_val, offset));
