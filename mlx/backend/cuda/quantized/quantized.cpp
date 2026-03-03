@@ -6,6 +6,7 @@
 #include "mlx/backend/cuda/device.h"
 #include "mlx/backend/cuda/gemms/cublas_gemm.h"
 #include "mlx/backend/cuda/quantized/qmm.h"
+#include "mlx/backend/cuda/quantized/qmm_sm120.h"
 #include "mlx/backend/cuda/quantized/qmv.h"
 #include "mlx/backend/cuda/quantized/quantized_utils.h"
 #include "mlx/backend/common/matmul.h"
@@ -99,8 +100,18 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
 
-  // MXFP4 / NVFP4: CuTe kernel for small M (aligned), dequant+cuBLAS otherwise.
+  // MXFP4 / NVFP4: SM120 native > CuTe dequant > dequant+cuBLAS.
   if (transpose_ && (mode_ == QuantizationMode::Mxfp4 || mode_ == QuantizationMode::Nvfp4)) {
+    // SM120 native block-scaled GEMM: uses hardware FP4 tensor cores.
+    // Both operands quantized to FP4 with block scaling — 2x throughput vs FP8.
+    // Requires: K % 128 == 0, N % 128 == 0 (TMA alignment for FP4 tiles).
+    // Minimum M >= 64: for smaller M, the activation quantization + TMA descriptor
+    // overhead exceeds the benefit. Fall through to CuTe QMM or dequant+cuBLAS.
+    bool sm120_aligned = (K % 128 == 0) && (N % 128 == 0);
+    if (d.compute_capability_major() >= 12 && sm120_aligned && M >= 64) {
+      cute_qmm_fp4_sm120(x, w, scales, out, bits_, group_size_, enc);
+      return;
+    }
     if (cute_aligned && M <= 64) {
       cute_qmm_fp4(x, w, scales, out, bits_, group_size_, enc);
     } else {
