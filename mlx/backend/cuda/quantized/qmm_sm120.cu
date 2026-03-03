@@ -236,6 +236,8 @@ __device__ __forceinline__ uint8_t quantize_float_to_e2m1(float v) {
   return bits;
 }
 
+// Optimized FP16 variant for FP4 activation quantization.
+// Single-pass with vectorized loads and half-precision amax.
 template <typename SFType, typename LayoutSF>
 __global__ void quantize_activation_fp4_kernel(
     const __half* __restrict__ input, // (M, K) row-major
@@ -254,32 +256,61 @@ __global__ void quantize_activation_fp4_kernel(
   int g = idx % num_groups;
   const __half* block_start = input + m * K + g * sf_vec_size;
 
-  // Compute max absolute value in block.
-  float amax = 0.0f;
-  for (int i = 0; i < sf_vec_size; i++) {
-    amax = fmaxf(amax, fabsf(__half2float(block_start[i])));
+  // Load all elements into registers using vectorized loads.
+  __half vals[32]; // max sf_vec_size
+  {
+    const float4* src4 = reinterpret_cast<const float4*>(block_start);
+    float4* dst4 = reinterpret_cast<float4*>(vals);
+    int num_vec_loads = sf_vec_size / 8;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+      if (i < num_vec_loads) {
+        dst4[i] = src4[i];
+      }
+    }
   }
 
-  // Scale: amax / max_representable_e2m1 (6.0).
+  // Compute amax using half-precision intrinsics.
+  __half2 pair_max = {__ushort_as_half(0), __ushort_as_half(0)};
+  {
+    const __half2* pairs = reinterpret_cast<const __half2*>(vals);
+    int num_pairs = sf_vec_size / 2;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+      if (i < num_pairs) {
+        __half2 abs_pair = __habs2(pairs[i]);
+        pair_max = __hmax2(pair_max, abs_pair);
+      }
+    }
+  }
+  float amax = fmaxf(__half2float(pair_max.x), __half2float(pair_max.y));
+
   float scale = (amax > 0.0f) ? (amax / 6.0f) : 1.0f;
   float inv_scale = 1.0f / scale;
 
-  // Store scale factor in CUTLASS interleaved layout.
   auto sf_offset = layout_sfa(m, g * sf_vec_size, 0);
   sf_out[sf_offset] = static_cast<SFType>(scale);
 
-  // Quantize and pack FP4 values (2 per byte, lower nibble first).
+  // Quantize from registers (no second global memory read).
   int pack_base = m * (K / 2) + g * (sf_vec_size / 2);
-  for (int i = 0; i < sf_vec_size; i += 2) {
-    float v0 = __half2float(block_start[i]) * inv_scale;
-    float v1 = __half2float(block_start[i + 1]) * inv_scale;
-    uint8_t q0 = quantize_float_to_e2m1(v0);
-    uint8_t q1 = quantize_float_to_e2m1(v1);
-    output[pack_base + i / 2] = q0 | (q1 << 4);
+  #pragma unroll
+  for (int i = 0; i < 32; i += 2) {
+    if (i < sf_vec_size) {
+      float v0 = __half2float(vals[i]) * inv_scale;
+      float v1 = __half2float(vals[i + 1]) * inv_scale;
+      uint8_t q0 = quantize_float_to_e2m1(v0);
+      uint8_t q1 = quantize_float_to_e2m1(v1);
+      output[pack_base + i / 2] = q0 | (q1 << 4);
+    }
   }
 }
 
-// BF16 variant for activation quantization.
+// Optimized BF16 variant for FP4 activation quantization.
+// Key optimizations vs original:
+// 1. Single pass: load all elements into registers, compute amax, quantize from registers
+//    (eliminates second global memory read — 2x bandwidth reduction)
+// 2. Vectorized loads: float4 (16 bytes = 8 bf16) instead of scalar bf16
+// 3. Half-precision amax: __habs2/__hmax2 intrinsics to avoid float conversion
 template <typename SFType, typename LayoutSF>
 __global__ void quantize_activation_fp4_bf16_kernel(
     const __nv_bfloat16* __restrict__ input,
@@ -298,10 +329,37 @@ __global__ void quantize_activation_fp4_bf16_kernel(
   int g = idx % num_groups;
   const __nv_bfloat16* block_start = input + m * K + g * sf_vec_size;
 
-  float amax = 0.0f;
-  for (int i = 0; i < sf_vec_size; i++) {
-    amax = fmaxf(amax, fabsf(__bfloat162float(block_start[i])));
+  // Load all elements into registers in one pass using vectorized loads.
+  // sf_vec_size is 16 (NVFP4) or 32 (MXFP4). Max register usage: 32 bf16 = 64 bytes.
+  // Use float4 loads (16 bytes = 8 bf16 per load).
+  __nv_bfloat16 vals[32]; // max sf_vec_size
+  {
+    const float4* src4 = reinterpret_cast<const float4*>(block_start);
+    float4* dst4 = reinterpret_cast<float4*>(vals);
+    int num_vec_loads = sf_vec_size / 8; // 8 bf16 per float4
+    #pragma unroll
+    for (int i = 0; i < 4; i++) { // max 4 loads (sf_vec_size=32)
+      if (i < num_vec_loads) {
+        dst4[i] = src4[i];
+      }
+    }
   }
+
+  // Compute amax using half-precision intrinsics (no float conversion).
+  __nv_bfloat162 pair_max = {__ushort_as_bfloat16(0), __ushort_as_bfloat16(0)};
+  {
+    const __nv_bfloat162* pairs = reinterpret_cast<const __nv_bfloat162*>(vals);
+    int num_pairs = sf_vec_size / 2;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) { // max 16 pairs (sf_vec_size=32)
+      if (i < num_pairs) {
+        __nv_bfloat162 abs_pair = __habs2(pairs[i]);
+        pair_max = __hmax2(pair_max, abs_pair);
+      }
+    }
+  }
+  // Reduce pair_max to scalar float amax.
+  float amax = fmaxf(__bfloat162float(pair_max.x), __bfloat162float(pair_max.y));
 
   float scale = (amax > 0.0f) ? (amax / 6.0f) : 1.0f;
   float inv_scale = 1.0f / scale;
@@ -309,13 +367,17 @@ __global__ void quantize_activation_fp4_bf16_kernel(
   auto sf_offset = layout_sfa(m, g * sf_vec_size, 0);
   sf_out[sf_offset] = static_cast<SFType>(scale);
 
+  // Quantize from registers (no second global memory read).
   int pack_base = m * (K / 2) + g * (sf_vec_size / 2);
-  for (int i = 0; i < sf_vec_size; i += 2) {
-    float v0 = __bfloat162float(block_start[i]) * inv_scale;
-    float v1 = __bfloat162float(block_start[i + 1]) * inv_scale;
-    uint8_t q0 = quantize_float_to_e2m1(v0);
-    uint8_t q1 = quantize_float_to_e2m1(v1);
-    output[pack_base + i / 2] = q0 | (q1 << 4);
+  #pragma unroll
+  for (int i = 0; i < 32; i += 2) {
+    if (i < sf_vec_size) {
+      float v0 = __bfloat162float(vals[i]) * inv_scale;
+      float v1 = __bfloat162float(vals[i + 1]) * inv_scale;
+      uint8_t q0 = quantize_float_to_e2m1(v0);
+      uint8_t q1 = quantize_float_to_e2m1(v1);
+      output[pack_base + i / 2] = q0 | (q1 << 4);
+    }
   }
 }
 
@@ -329,6 +391,8 @@ __global__ void quantize_activation_fp4_bf16_kernel(
 // e4m3 representable range: ±[2^-9, 448]. Max magnitude = 448.0.
 // ============================================================================
 
+// Optimized FP16 variant for FP8 activation quantization.
+// Single-pass with vectorized loads and half-precision amax.
 template <typename SFType, typename LayoutSF>
 __global__ void quantize_activation_fp8_kernel(
     const __half* __restrict__ input, // (M, K) row-major
@@ -347,30 +411,47 @@ __global__ void quantize_activation_fp8_kernel(
   int g = idx % num_groups;
   const __half* block_start = input + m * K + g * sf_vec_size;
 
-  // Compute max absolute value in block.
-  float amax = 0.0f;
-  for (int i = 0; i < sf_vec_size; i++) {
-    amax = fmaxf(amax, fabsf(__half2float(block_start[i])));
+  // Single-pass: load all elements into registers using vectorized loads.
+  __half vals[32]; // FP8 sf_vec_size is always 32
+  {
+    const float4* src4 = reinterpret_cast<const float4*>(block_start);
+    float4* dst4 = reinterpret_cast<float4*>(vals);
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+      dst4[i] = src4[i];
+    }
   }
 
-  // Scale: amax / max_representable_e4m3 (448.0).
+  // Compute amax using half-precision intrinsics.
+  __half2 pair_max = {__ushort_as_half(0), __ushort_as_half(0)};
+  {
+    const __half2* pairs = reinterpret_cast<const __half2*>(vals);
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+      __half2 abs_pair = __habs2(pairs[i]);
+      pair_max = __hmax2(pair_max, abs_pair);
+    }
+  }
+  float amax = fmaxf(__half2float(pair_max.x), __half2float(pair_max.y));
+
   float scale = (amax > 0.0f) ? (amax / 448.0f) : 1.0f;
   float inv_scale = 1.0f / scale;
 
-  // Store scale factor in CUTLASS interleaved layout.
   auto sf_offset = layout_sfa(m, g * sf_vec_size, 0);
   sf_out[sf_offset] = static_cast<SFType>(scale);
 
-  // Quantize: 1 byte per element (no packing).
+  // Quantize from registers.
   int out_base = m * K + g * sf_vec_size;
-  for (int i = 0; i < sf_vec_size; i++) {
-    float v = __half2float(block_start[i]) * inv_scale;
+  #pragma unroll
+  for (int i = 0; i < 32; i++) {
+    float v = __half2float(vals[i]) * inv_scale;
     __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(v);
     output[out_base + i] = *reinterpret_cast<uint8_t*>(&fp8);
   }
 }
 
-// BF16 variant for FP8 activation quantization.
+// Optimized BF16 variant for FP8 activation quantization.
+// Same single-pass + vectorized load optimizations as FP4 variant.
 template <typename SFType, typename LayoutSF>
 __global__ void quantize_activation_fp8_bf16_kernel(
     const __nv_bfloat16* __restrict__ input,
@@ -389,10 +470,30 @@ __global__ void quantize_activation_fp8_bf16_kernel(
   int g = idx % num_groups;
   const __nv_bfloat16* block_start = input + m * K + g * sf_vec_size;
 
-  float amax = 0.0f;
-  for (int i = 0; i < sf_vec_size; i++) {
-    amax = fmaxf(amax, fabsf(__bfloat162float(block_start[i])));
+  // Single-pass: load all elements into registers using vectorized loads.
+  // FP8 sf_vec_size is always 32 (MXFP8). 32 bf16 = 64 bytes.
+  __nv_bfloat16 vals[32];
+  {
+    const float4* src4 = reinterpret_cast<const float4*>(block_start);
+    float4* dst4 = reinterpret_cast<float4*>(vals);
+    // 32 bf16 / 8 per float4 = 4 loads
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+      dst4[i] = src4[i];
+    }
   }
+
+  // Compute amax using half-precision intrinsics.
+  __nv_bfloat162 pair_max = {__ushort_as_bfloat16(0), __ushort_as_bfloat16(0)};
+  {
+    const __nv_bfloat162* pairs = reinterpret_cast<const __nv_bfloat162*>(vals);
+    #pragma unroll
+    for (int i = 0; i < 16; i++) { // 32/2 = 16 pairs
+      __nv_bfloat162 abs_pair = __habs2(pairs[i]);
+      pair_max = __hmax2(pair_max, abs_pair);
+    }
+  }
+  float amax = fmaxf(__bfloat162float(pair_max.x), __bfloat162float(pair_max.y));
 
   float scale = (amax > 0.0f) ? (amax / 448.0f) : 1.0f;
   float inv_scale = 1.0f / scale;
@@ -400,9 +501,11 @@ __global__ void quantize_activation_fp8_bf16_kernel(
   auto sf_offset = layout_sfa(m, g * sf_vec_size, 0);
   sf_out[sf_offset] = static_cast<SFType>(scale);
 
+  // Quantize from registers (no second global memory read).
   int out_base = m * K + g * sf_vec_size;
-  for (int i = 0; i < sf_vec_size; i++) {
-    float v = __bfloat162float(block_start[i]) * inv_scale;
+  #pragma unroll
+  for (int i = 0; i < 32; i++) {
+    float v = __bfloat162float(vals[i]) * inv_scale;
     __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(v);
     output[out_base + i] = *reinterpret_cast<uint8_t*>(&fp8);
   }
