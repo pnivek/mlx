@@ -202,11 +202,19 @@ __global__ void reformat_sf_kernel(
 }
 
 // ============================================================================
-// Activation quantization kernel.
+// Activation quantization kernels (warp-cooperative).
 //
-// Quantizes fp16/bf16 activations to FP4 (e2m1) with per-block scale factors
-// in CUTLASS interleaved layout. Each thread handles one block of sf_vec_size
-// elements.
+// Quantizes fp16/bf16 activations to FP4 (e2m1) or FP8 (e4m3) with per-block
+// scale factors in CUTLASS interleaved layout.
+//
+// Design: Each WARP processes one group (sf_vec_size=32) or two groups
+// (sf_vec_size=16). Each thread loads and quantizes exactly ONE element.
+// Benefits:
+//   - Perfectly coalesced reads: warp reads 32 consecutive half values = 64 bytes
+//   - Perfectly coalesced writes: warp writes 32 (FP8) or 16 (FP4) bytes
+//   - Warp shuffle for amax reduction: O(log n) instead of sequential
+//   - Minimal register pressure: 1 value per thread (not 32)
+//   - High occupancy: few registers per thread -> more warps per SM
 // ============================================================================
 
 // Quantize a float to 4-bit e2m1 encoding (1 sign + 2 exp + 1 mantissa).
@@ -236,222 +244,174 @@ __device__ __forceinline__ uint8_t quantize_float_to_e2m1(float v) {
   return bits;
 }
 
-// Optimized FP16 variant for FP4 activation quantization.
-// Single-pass with vectorized loads and half-precision amax.
-template <typename SFType, typename LayoutSF>
+// FP4 activation quantization — FP16 input, warp-cooperative.
+// SF_VEC_SIZE: 16 (NVFP4) or 32 (MXFP4). Templated for compile-time optimization.
+template <int SF_VEC_SIZE, typename SFType, typename LayoutSF>
 __global__ void quantize_activation_fp4_kernel(
-    const __half* __restrict__ input, // (M, K) row-major
-    uint8_t* __restrict__ output,     // (M, K/2) packed FP4
-    SFType* __restrict__ sf_out,      // CUTLASS-format scale factors
+    const __half* __restrict__ input,
+    uint8_t* __restrict__ output,
+    SFType* __restrict__ sf_out,
     LayoutSF layout_sfa,
     int M,
-    int K,
-    int sf_vec_size) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int num_groups = K / sf_vec_size;
-  int total = M * num_groups;
-  if (idx >= total) return;
+    int K) {
+  constexpr int GROUPS_PER_WARP = 32 / SF_VEC_SIZE;
+  int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int warp_id = global_tid / 32;
+  int lane = global_tid % 32;
+  int sub_group = lane / SF_VEC_SIZE;
+  int local_lane = lane % SF_VEC_SIZE;
 
-  int m = idx / num_groups;
-  int g = idx % num_groups;
-  const __half* block_start = input + m * K + g * sf_vec_size;
+  int num_groups = K / SF_VEC_SIZE;
+  int total_groups = M * num_groups;
+  int group_idx = warp_id * GROUPS_PER_WARP + sub_group;
 
-  // Load all elements into registers using vectorized loads.
-  __half vals[32]; // max sf_vec_size
-  {
-    const float4* src4 = reinterpret_cast<const float4*>(block_start);
-    float4* dst4 = reinterpret_cast<float4*>(vals);
-    int num_vec_loads = sf_vec_size / 8;
-    #pragma unroll
-    for (int i = 0; i < 4; i++) {
-      if (i < num_vec_loads) {
-        dst4[i] = src4[i];
-      }
-    }
+  // For SF_VEC_SIZE=16, last warp's second sub-group may be OOB.
+  // Use safe index for loads (read harmless data), guard writes with 'valid'.
+  bool valid = (group_idx < total_groups);
+  int safe_idx = valid ? group_idx : (total_groups - 1);
+  int m = safe_idx / num_groups;
+  int g = safe_idx % num_groups;
+
+  // Coalesced load: warp reads 32 consecutive half values = 64 bytes.
+  __half val = input[m * K + g * SF_VEC_SIZE + local_lane];
+  float abs_val = fabsf(__half2float(val));
+
+  // Warp shuffle amax reduction within sub-group.
+  unsigned sub_mask = ((1u << SF_VEC_SIZE) - 1) << (sub_group * SF_VEC_SIZE);
+  #pragma unroll
+  for (int offset = SF_VEC_SIZE / 2; offset > 0; offset >>= 1) {
+    abs_val = fmaxf(abs_val, __shfl_xor_sync(sub_mask, abs_val, offset));
   }
 
-  // Compute amax using half-precision intrinsics.
-  __half2 pair_max = {__ushort_as_half(0), __ushort_as_half(0)};
-  {
-    const __half2* pairs = reinterpret_cast<const __half2*>(vals);
-    int num_pairs = sf_vec_size / 2;
-    #pragma unroll
-    for (int i = 0; i < 16; i++) {
-      if (i < num_pairs) {
-        __half2 abs_pair = __habs2(pairs[i]);
-        pair_max = __hmax2(pair_max, abs_pair);
-      }
-    }
-  }
-  float amax = fmaxf(__half2float(pair_max.x), __half2float(pair_max.y));
-
-  float scale = (amax > 0.0f) ? (amax / 6.0f) : 1.0f;
+  float scale = (abs_val > 0.0f) ? (abs_val / 6.0f) : 1.0f;
   float inv_scale = 1.0f / scale;
 
-  auto sf_offset = layout_sfa(m, g * sf_vec_size, 0);
-  sf_out[sf_offset] = static_cast<SFType>(scale);
+  if (valid && local_lane == 0) {
+    auto sf_offset = layout_sfa(m, g * SF_VEC_SIZE, 0);
+    sf_out[sf_offset] = static_cast<SFType>(scale);
+  }
 
-  // Quantize from registers (no second global memory read).
-  int pack_base = m * (K / 2) + g * (sf_vec_size / 2);
-  #pragma unroll
-  for (int i = 0; i < 32; i += 2) {
-    if (i < sf_vec_size) {
-      float v0 = __half2float(vals[i]) * inv_scale;
-      float v1 = __half2float(vals[i + 1]) * inv_scale;
-      uint8_t q0 = quantize_float_to_e2m1(v0);
-      uint8_t q1 = quantize_float_to_e2m1(v1);
-      output[pack_base + i / 2] = q0 | (q1 << 4);
-    }
+  // Quantize to e2m1 and pack pairs via warp shuffle.
+  float v = __half2float(val) * inv_scale;
+  uint8_t q = quantize_float_to_e2m1(v);
+  uint8_t partner_q = static_cast<uint8_t>(
+      __shfl_xor_sync(sub_mask, static_cast<unsigned>(q), 1));
+  if (valid && (local_lane & 1) == 0) {
+    int pack_addr = m * (K / 2) + g * (SF_VEC_SIZE / 2) + local_lane / 2;
+    output[pack_addr] = q | (partner_q << 4);
   }
 }
 
-// Optimized BF16 variant for FP4 activation quantization.
-// Key optimizations vs original:
-// 1. Single pass: load all elements into registers, compute amax, quantize from registers
-//    (eliminates second global memory read — 2x bandwidth reduction)
-// 2. Vectorized loads: float4 (16 bytes = 8 bf16) instead of scalar bf16
-// 3. Half-precision amax: __habs2/__hmax2 intrinsics to avoid float conversion
-template <typename SFType, typename LayoutSF>
+// FP4 activation quantization — BF16 input, warp-cooperative.
+template <int SF_VEC_SIZE, typename SFType, typename LayoutSF>
 __global__ void quantize_activation_fp4_bf16_kernel(
     const __nv_bfloat16* __restrict__ input,
     uint8_t* __restrict__ output,
     SFType* __restrict__ sf_out,
     LayoutSF layout_sfa,
     int M,
-    int K,
-    int sf_vec_size) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int num_groups = K / sf_vec_size;
-  int total = M * num_groups;
-  if (idx >= total) return;
+    int K) {
+  constexpr int GROUPS_PER_WARP = 32 / SF_VEC_SIZE;
+  int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int warp_id = global_tid / 32;
+  int lane = global_tid % 32;
+  int sub_group = lane / SF_VEC_SIZE;
+  int local_lane = lane % SF_VEC_SIZE;
 
-  int m = idx / num_groups;
-  int g = idx % num_groups;
-  const __nv_bfloat16* block_start = input + m * K + g * sf_vec_size;
+  int num_groups = K / SF_VEC_SIZE;
+  int total_groups = M * num_groups;
+  int group_idx = warp_id * GROUPS_PER_WARP + sub_group;
 
-  // Load all elements into registers in one pass using vectorized loads.
-  // sf_vec_size is 16 (NVFP4) or 32 (MXFP4). Max register usage: 32 bf16 = 64 bytes.
-  // Use float4 loads (16 bytes = 8 bf16 per load).
-  __nv_bfloat16 vals[32]; // max sf_vec_size
-  {
-    const float4* src4 = reinterpret_cast<const float4*>(block_start);
-    float4* dst4 = reinterpret_cast<float4*>(vals);
-    int num_vec_loads = sf_vec_size / 8; // 8 bf16 per float4
-    #pragma unroll
-    for (int i = 0; i < 4; i++) { // max 4 loads (sf_vec_size=32)
-      if (i < num_vec_loads) {
-        dst4[i] = src4[i];
-      }
-    }
+  bool valid = (group_idx < total_groups);
+  int safe_idx = valid ? group_idx : (total_groups - 1);
+  int m = safe_idx / num_groups;
+  int g = safe_idx % num_groups;
+
+  __nv_bfloat16 val = input[m * K + g * SF_VEC_SIZE + local_lane];
+  float abs_val = fabsf(__bfloat162float(val));
+
+  unsigned sub_mask = ((1u << SF_VEC_SIZE) - 1) << (sub_group * SF_VEC_SIZE);
+  #pragma unroll
+  for (int offset = SF_VEC_SIZE / 2; offset > 0; offset >>= 1) {
+    abs_val = fmaxf(abs_val, __shfl_xor_sync(sub_mask, abs_val, offset));
   }
 
-  // Compute amax using half-precision intrinsics (no float conversion).
-  __nv_bfloat162 pair_max = {__ushort_as_bfloat16(0), __ushort_as_bfloat16(0)};
-  {
-    const __nv_bfloat162* pairs = reinterpret_cast<const __nv_bfloat162*>(vals);
-    int num_pairs = sf_vec_size / 2;
-    #pragma unroll
-    for (int i = 0; i < 16; i++) { // max 16 pairs (sf_vec_size=32)
-      if (i < num_pairs) {
-        __nv_bfloat162 abs_pair = __habs2(pairs[i]);
-        pair_max = __hmax2(pair_max, abs_pair);
-      }
-    }
-  }
-  // Reduce pair_max to scalar float amax.
-  float amax = fmaxf(__bfloat162float(pair_max.x), __bfloat162float(pair_max.y));
-
-  float scale = (amax > 0.0f) ? (amax / 6.0f) : 1.0f;
+  float scale = (abs_val > 0.0f) ? (abs_val / 6.0f) : 1.0f;
   float inv_scale = 1.0f / scale;
 
-  auto sf_offset = layout_sfa(m, g * sf_vec_size, 0);
-  sf_out[sf_offset] = static_cast<SFType>(scale);
+  if (valid && local_lane == 0) {
+    auto sf_offset = layout_sfa(m, g * SF_VEC_SIZE, 0);
+    sf_out[sf_offset] = static_cast<SFType>(scale);
+  }
 
-  // Quantize from registers (no second global memory read).
-  int pack_base = m * (K / 2) + g * (sf_vec_size / 2);
-  #pragma unroll
-  for (int i = 0; i < 32; i += 2) {
-    if (i < sf_vec_size) {
-      float v0 = __bfloat162float(vals[i]) * inv_scale;
-      float v1 = __bfloat162float(vals[i + 1]) * inv_scale;
-      uint8_t q0 = quantize_float_to_e2m1(v0);
-      uint8_t q1 = quantize_float_to_e2m1(v1);
-      output[pack_base + i / 2] = q0 | (q1 << 4);
-    }
+  float v = __bfloat162float(val) * inv_scale;
+  uint8_t q = quantize_float_to_e2m1(v);
+  uint8_t partner_q = static_cast<uint8_t>(
+      __shfl_xor_sync(sub_mask, static_cast<unsigned>(q), 1));
+  if (valid && (local_lane & 1) == 0) {
+    int pack_addr = m * (K / 2) + g * (SF_VEC_SIZE / 2) + local_lane / 2;
+    output[pack_addr] = q | (partner_q << 4);
   }
 }
 
 // ============================================================================
-// FP8 (e4m3) activation quantization kernel.
+// FP8 (e4m3) activation quantization — warp-cooperative.
 //
-// Quantizes fp16/bf16 activations to FP8 (e4m3) with per-block ue8m0 scale
-// factors in CUTLASS interleaved layout. Unlike FP4, FP8 stores 1 byte per
-// element (no nibble packing).
+// Each warp processes one group of 32 elements (sf_vec_size is always 32 for
+// MXFP8). Each thread loads 1 element, reduces amax via shuffle, quantizes,
+// and writes 1 byte (no nibble packing like FP4).
 //
-// e4m3 representable range: ±[2^-9, 448]. Max magnitude = 448.0.
+// e4m3 representable range: +/-[2^-9, 448]. Max magnitude = 448.0.
 // ============================================================================
 
-// Optimized FP16 variant for FP8 activation quantization.
-// Single-pass with vectorized loads and half-precision amax.
+// FP8 activation quantization — FP16 input, warp-cooperative.
 template <typename SFType, typename LayoutSF>
 __global__ void quantize_activation_fp8_kernel(
-    const __half* __restrict__ input, // (M, K) row-major
-    uint8_t* __restrict__ output,     // (M, K) FP8 e4m3 (1 byte per element)
-    SFType* __restrict__ sf_out,      // CUTLASS-format scale factors
+    const __half* __restrict__ input,
+    uint8_t* __restrict__ output,
+    SFType* __restrict__ sf_out,
     LayoutSF layout_sfa,
     int M,
-    int K,
-    int sf_vec_size) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int num_groups = K / sf_vec_size;
-  int total = M * num_groups;
-  if (idx >= total) return;
+    int K) {
+  // sf_vec_size is always 32 for MXFP8 -> 1 group per warp.
+  constexpr int SF_VEC_SIZE = 32;
+  int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int warp_id = global_tid / 32;
+  int lane = global_tid % 32;
 
-  int m = idx / num_groups;
-  int g = idx % num_groups;
-  const __half* block_start = input + m * K + g * sf_vec_size;
+  int num_groups = K / SF_VEC_SIZE;
+  int total_groups = M * num_groups;
+  if (warp_id >= total_groups) return;
 
-  // Single-pass: load all elements into registers using vectorized loads.
-  __half vals[32]; // FP8 sf_vec_size is always 32
-  {
-    const float4* src4 = reinterpret_cast<const float4*>(block_start);
-    float4* dst4 = reinterpret_cast<float4*>(vals);
-    #pragma unroll
-    for (int i = 0; i < 4; i++) {
-      dst4[i] = src4[i];
-    }
+  int m = warp_id / num_groups;
+  int g = warp_id % num_groups;
+  int addr = m * K + g * SF_VEC_SIZE + lane;
+
+  // Coalesced load: 32 threads read 32 consecutive half values = 64 bytes.
+  __half val = input[addr];
+  float abs_val = fabsf(__half2float(val));
+
+  // Warp-level amax reduction (full warp, all 32 threads).
+  #pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    abs_val = fmaxf(abs_val, __shfl_xor_sync(0xffffffff, abs_val, offset));
   }
 
-  // Compute amax using half-precision intrinsics.
-  __half2 pair_max = {__ushort_as_half(0), __ushort_as_half(0)};
-  {
-    const __half2* pairs = reinterpret_cast<const __half2*>(vals);
-    #pragma unroll
-    for (int i = 0; i < 16; i++) {
-      __half2 abs_pair = __habs2(pairs[i]);
-      pair_max = __hmax2(pair_max, abs_pair);
-    }
-  }
-  float amax = fmaxf(__half2float(pair_max.x), __half2float(pair_max.y));
-
-  float scale = (amax > 0.0f) ? (amax / 448.0f) : 1.0f;
+  float scale = (abs_val > 0.0f) ? (abs_val / 448.0f) : 1.0f;
   float inv_scale = 1.0f / scale;
 
-  auto sf_offset = layout_sfa(m, g * sf_vec_size, 0);
-  sf_out[sf_offset] = static_cast<SFType>(scale);
-
-  // Quantize from registers.
-  int out_base = m * K + g * sf_vec_size;
-  #pragma unroll
-  for (int i = 0; i < 32; i++) {
-    float v = __half2float(vals[i]) * inv_scale;
-    __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(v);
-    output[out_base + i] = *reinterpret_cast<uint8_t*>(&fp8);
+  if (lane == 0) {
+    auto sf_offset = layout_sfa(m, g * SF_VEC_SIZE, 0);
+    sf_out[sf_offset] = static_cast<SFType>(scale);
   }
+
+  // Quantize and store — coalesced 32-byte write.
+  float v = __half2float(val) * inv_scale;
+  __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(v);
+  output[addr] = *reinterpret_cast<uint8_t*>(&fp8);
 }
 
-// Optimized BF16 variant for FP8 activation quantization.
-// Same single-pass + vectorized load optimizations as FP4 variant.
+// FP8 activation quantization — BF16 input, warp-cooperative.
 template <typename SFType, typename LayoutSF>
 __global__ void quantize_activation_fp8_bf16_kernel(
     const __nv_bfloat16* __restrict__ input,
@@ -459,56 +419,39 @@ __global__ void quantize_activation_fp8_bf16_kernel(
     SFType* __restrict__ sf_out,
     LayoutSF layout_sfa,
     int M,
-    int K,
-    int sf_vec_size) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int num_groups = K / sf_vec_size;
-  int total = M * num_groups;
-  if (idx >= total) return;
+    int K) {
+  constexpr int SF_VEC_SIZE = 32;
+  int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int warp_id = global_tid / 32;
+  int lane = global_tid % 32;
 
-  int m = idx / num_groups;
-  int g = idx % num_groups;
-  const __nv_bfloat16* block_start = input + m * K + g * sf_vec_size;
+  int num_groups = K / SF_VEC_SIZE;
+  int total_groups = M * num_groups;
+  if (warp_id >= total_groups) return;
 
-  // Single-pass: load all elements into registers using vectorized loads.
-  // FP8 sf_vec_size is always 32 (MXFP8). 32 bf16 = 64 bytes.
-  __nv_bfloat16 vals[32];
-  {
-    const float4* src4 = reinterpret_cast<const float4*>(block_start);
-    float4* dst4 = reinterpret_cast<float4*>(vals);
-    // 32 bf16 / 8 per float4 = 4 loads
-    #pragma unroll
-    for (int i = 0; i < 4; i++) {
-      dst4[i] = src4[i];
-    }
+  int m = warp_id / num_groups;
+  int g = warp_id % num_groups;
+  int addr = m * K + g * SF_VEC_SIZE + lane;
+
+  __nv_bfloat16 val = input[addr];
+  float abs_val = fabsf(__bfloat162float(val));
+
+  #pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    abs_val = fmaxf(abs_val, __shfl_xor_sync(0xffffffff, abs_val, offset));
   }
 
-  // Compute amax using half-precision intrinsics.
-  __nv_bfloat162 pair_max = {__ushort_as_bfloat16(0), __ushort_as_bfloat16(0)};
-  {
-    const __nv_bfloat162* pairs = reinterpret_cast<const __nv_bfloat162*>(vals);
-    #pragma unroll
-    for (int i = 0; i < 16; i++) { // 32/2 = 16 pairs
-      __nv_bfloat162 abs_pair = __habs2(pairs[i]);
-      pair_max = __hmax2(pair_max, abs_pair);
-    }
-  }
-  float amax = fmaxf(__bfloat162float(pair_max.x), __bfloat162float(pair_max.y));
-
-  float scale = (amax > 0.0f) ? (amax / 448.0f) : 1.0f;
+  float scale = (abs_val > 0.0f) ? (abs_val / 448.0f) : 1.0f;
   float inv_scale = 1.0f / scale;
 
-  auto sf_offset = layout_sfa(m, g * sf_vec_size, 0);
-  sf_out[sf_offset] = static_cast<SFType>(scale);
-
-  // Quantize from registers (no second global memory read).
-  int out_base = m * K + g * sf_vec_size;
-  #pragma unroll
-  for (int i = 0; i < 32; i++) {
-    float v = __bfloat162float(vals[i]) * inv_scale;
-    __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(v);
-    output[out_base + i] = *reinterpret_cast<uint8_t*>(&fp8);
+  if (lane == 0) {
+    auto sf_offset = layout_sfa(m, g * SF_VEC_SIZE, 0);
+    sf_out[sf_offset] = static_cast<SFType>(scale);
   }
+
+  float v = __bfloat162float(val) * inv_scale;
+  __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(v);
+  output[addr] = *reinterpret_cast<uint8_t*>(&fp8);
 }
 
 } // anonymous namespace (helper __global__ kernels)
@@ -744,21 +687,27 @@ void execute_sm120_fp4_gemm(
   auto& stream = encoder.stream();
   constexpr int kThreads = 256;
 
-  // Step 1: Quantize activations to FP4.
+  // Step 1: Quantize activations to FP4 (warp-cooperative).
+  // Grid is based on warps: each warp handles 32/sf_vec_size groups.
   {
-    int blocks = (num_act_groups + kThreads - 1) / kThreads;
+    constexpr int GROUPS_PER_WARP = 32 / BlkConfig::SFVecSize;
+    int total_warps = (num_act_groups + GROUPS_PER_WARP - 1) / GROUPS_PER_WARP;
+    int total_threads = total_warps * 32;
+    int blocks = (total_threads + kThreads - 1) / kThreads;
     if constexpr (std::is_same_v<InputType, __nv_bfloat16>) {
-      quantize_activation_fp4_bf16_kernel<<<blocks, kThreads, 0, stream>>>(
+      quantize_activation_fp4_bf16_kernel<BlkConfig::SFVecSize>
+          <<<blocks, kThreads, 0, stream>>>(
           reinterpret_cast<const __nv_bfloat16*>(x.data<void>()),
           reinterpret_cast<uint8_t*>(x_q_buf.data<void>()),
           reinterpret_cast<SFType*>(sfa_buf.data<void>()),
-          layout_SFA, M, K, sf_vec_size);
+          layout_SFA, M, K);
     } else {
-      quantize_activation_fp4_kernel<<<blocks, kThreads, 0, stream>>>(
+      quantize_activation_fp4_kernel<BlkConfig::SFVecSize>
+          <<<blocks, kThreads, 0, stream>>>(
           reinterpret_cast<const __half*>(x.data<void>()),
           reinterpret_cast<uint8_t*>(x_q_buf.data<void>()),
           reinterpret_cast<SFType*>(sfa_buf.data<void>()),
-          layout_SFA, M, K, sf_vec_size);
+          layout_SFA, M, K);
     }
   }
 
@@ -844,21 +793,24 @@ void execute_sm120_fp8_gemm(
   auto& stream = encoder.stream();
   constexpr int kThreads = 256;
 
-  // Step 1: Quantize activations to FP8 (e4m3).
+  // Step 1: Quantize activations to FP8 (warp-cooperative, sf_vec_size=32).
+  // Each warp processes one group of 32 elements.
   {
-    int blocks = (num_act_groups + kThreads - 1) / kThreads;
+    int total_warps = num_act_groups; // 1 group per warp
+    int total_threads = total_warps * 32;
+    int blocks = (total_threads + kThreads - 1) / kThreads;
     if constexpr (std::is_same_v<InputType, __nv_bfloat16>) {
       quantize_activation_fp8_bf16_kernel<<<blocks, kThreads, 0, stream>>>(
           reinterpret_cast<const __nv_bfloat16*>(x.data<void>()),
           reinterpret_cast<uint8_t*>(x_q_buf.data<void>()),
           reinterpret_cast<SFType*>(sfa_buf.data<void>()),
-          layout_SFA, M, K, sf_vec_size);
+          layout_SFA, M, K);
     } else {
       quantize_activation_fp8_kernel<<<blocks, kThreads, 0, stream>>>(
           reinterpret_cast<const __half*>(x.data<void>()),
           reinterpret_cast<uint8_t*>(x_q_buf.data<void>()),
           reinterpret_cast<SFType*>(sfa_buf.data<void>()),
-          layout_SFA, M, K, sf_vec_size);
+          layout_SFA, M, K);
     }
   }
 
