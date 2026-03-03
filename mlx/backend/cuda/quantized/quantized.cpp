@@ -124,9 +124,11 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   // MXFP8: SM120 native > dequant+cuBLAS fallback.
   // SM120 uses m16n8k32 MMA with ue8m0 scale factors (TileShape K=128).
-  // M <= 8 already dispatched to QMV above, so SM120 handles all M >= 9.
+  // M <= 8 already dispatched to QMV above. SM120 is faster than
+  // dequant+cuBLAS for small-to-moderate M; at large M the activation
+  // quantization overhead dominates and cuBLAS wins, so cap at M <= 512.
   if (transpose_ && mode_ == QuantizationMode::Mxfp8) {
-    if (d.compute_capability_major() >= 12 && (K % 128 == 0)) {
+    if (d.compute_capability_major() >= 12 && (K % 128 == 0) && M <= 512) {
       cute_qmm_fp8_sm120(x, w, scales, out, group_size_, enc);
       return;
     }
@@ -137,10 +139,12 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 
   // Affine quantization: CuTe kernel for aligned dims, dequant+cuBLAS otherwise.
-  // CuTe tiles M into BM=32 blocks with partial-tile predicates, so any M works.
-  // For very large M (>512), cuBLAS's optimized kernels may be faster, so we cap.
+  // CuTe fused dequant+matmul wins at small M (memory-bound), but at M >= 128
+  // cuBLAS with a separate dequant pass achieves higher TFLOP/s due to better
+  // tiling and occupancy. INT4 affine can't use SM120 native tensor cores
+  // (not a block-scaled format), so both paths dequantize in software.
   if (transpose_ && biases && mode_ == QuantizationMode::Affine) {
-    if (cute_aligned && M <= 512) {
+    if (cute_aligned && M <= 64) {
       cute_qmm(x, w, scales, *biases, out, bits_, group_size_, enc);
     } else {
       array w_dequant = alloc_dequant_buffer(N, K, out.dtype(), enc);
