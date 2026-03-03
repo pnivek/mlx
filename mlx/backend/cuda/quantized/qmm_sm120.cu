@@ -699,28 +699,16 @@ static void* get_configured_kernel_mxfp4_fp16() {
   return ptr;
 }
 
-void cute_qmm_fp4_sm120(
+// Helper: dispatch to the correct execute_sm120_fp4_gemm variant based on
+// group_size and output dtype.
+static void dispatch_sm120_fp4(
     const array& x,
     const array& w,
     const array& scales,
     array& out,
-    int bits,
     int group_size,
     cu::CommandEncoder& encoder) {
   const char* tag = "[qmm_fp4_sm120]";
-  int M = out.shape(-2);
-  int N = out.shape(-1);
-  int K = x.shape(-1);
-
-  if (bits != 4) {
-    throw std::runtime_error(
-        fmt::format("{} Only 4-bit quantization supported.", tag));
-  }
-
-  encoder.set_input_array(x);
-  encoder.set_input_array(w);
-  encoder.set_input_array(scales);
-  encoder.set_output_array(out);
 
   if (group_size == 16) {
     // NVFP4: nv_float4_t with ue4m3 scale factors, SFVecSize=16.
@@ -756,6 +744,85 @@ void cute_qmm_fp4_sm120(
         "Expected 16 (NVFP4) or 32 (MXFP4).",
         tag, group_size));
   }
+}
+
+void cute_qmm_fp4_sm120(
+    const array& x,
+    const array& w,
+    const array& scales,
+    array& out,
+    int bits,
+    int group_size,
+    cu::CommandEncoder& encoder) {
+  const char* tag = "[qmm_fp4_sm120]";
+  int M = out.shape(-2);
+  int N = out.shape(-1);
+  int K = x.shape(-1);
+
+  if (bits != 4) {
+    throw std::runtime_error(
+        fmt::format("{} Only 4-bit quantization supported.", tag));
+  }
+
+  encoder.set_input_array(x);
+  encoder.set_input_array(w);
+  encoder.set_input_array(scales);
+  encoder.set_output_array(out);
+
+  // SM120 TMA requires N % 128 == 0 and K % 128 == 0.
+  // When N is not 128-aligned (e.g. DSv3 N=1407), pad weights, scales, and
+  // output to the next 128 multiple, run GEMM, then extract valid columns.
+  // Zero-padded weight rows produce zero GEMM contributions.
+  int N_padded = (N + 127) / 128 * 128;
+  bool needs_n_pad = (N_padded != N);
+
+  if (needs_n_pad) {
+    auto& stream = encoder.stream();
+    size_t elem_size = size_of(out.dtype());
+
+    // Padded weight buffer: (N_padded, K/2) — first N rows from w, rest zero.
+    int w_cols = w.shape(-1);
+    array w_pad({N_padded, w_cols}, w.dtype(), nullptr, {});
+    w_pad.set_data(cu::malloc_async(w_pad.nbytes(), encoder));
+    encoder.add_temporary(w_pad);
+    cudaMemsetAsync(w_pad.data<void>(), 0, w_pad.nbytes(), stream);
+    cudaMemcpyAsync(
+        w_pad.data<void>(), w.data<void>(), w.nbytes(),
+        cudaMemcpyDeviceToDevice, stream);
+
+    // Padded scale buffer: (N_padded, K/gs) — first N rows from scales, rest zero.
+    int s_cols = scales.shape(-1);
+    array s_pad({N_padded, s_cols}, scales.dtype(), nullptr, {});
+    s_pad.set_data(cu::malloc_async(s_pad.nbytes(), encoder));
+    encoder.add_temporary(s_pad);
+    cudaMemsetAsync(s_pad.data<void>(), 0, s_pad.nbytes(), stream);
+    cudaMemcpyAsync(
+        s_pad.data<void>(), scales.data<void>(), scales.nbytes(),
+        cudaMemcpyDeviceToDevice, stream);
+
+    // Padded output: (M, N_padded).
+    array out_pad({M, N_padded}, out.dtype(), nullptr, {});
+    out_pad.set_data(cu::malloc_async(out_pad.nbytes(), encoder));
+    encoder.add_temporary(out_pad);
+
+    // Run GEMM with padded dimensions.
+    dispatch_sm120_fp4(x, w_pad, s_pad, out_pad, group_size, encoder);
+
+    // Extract first N columns from each row of padded output.
+    cudaMemcpy2DAsync(
+        out.data<void>(),           // dst
+        N * elem_size,              // dst pitch (row stride in bytes)
+        out_pad.data<void>(),       // src
+        N_padded * elem_size,       // src pitch
+        N * elem_size,              // width to copy per row
+        M,                          // number of rows
+        cudaMemcpyDeviceToDevice,
+        stream);
+    return;
+  }
+
+  // Normal aligned path — no padding needed.
+  dispatch_sm120_fp4(x, w, scales, out, group_size, encoder);
 }
 
 // ============================================================================

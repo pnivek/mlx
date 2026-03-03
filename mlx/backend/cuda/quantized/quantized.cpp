@@ -104,12 +104,11 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (transpose_ && (mode_ == QuantizationMode::Mxfp4 || mode_ == QuantizationMode::Nvfp4)) {
     // SM120 native block-scaled GEMM: uses hardware FP4 tensor cores.
     // Both operands quantized to FP4 with block scaling — 2x throughput vs FP8.
-    // Requires: K % 128 == 0, N % 128 == 0 (TMA alignment for FP4 tiles).
+    // Requires: K % 128 == 0. N is padded to 128 alignment internally if needed.
     // M <= 8 already dispatched to QMV above, so SM120 handles all M >= 9.
     // The CuTe LUT-based FP4 dequant path is significantly slower than SM120
-    // native tensor cores, so we prefer SM120 whenever alignment permits.
-    bool sm120_aligned = (K % 128 == 0) && (N % 128 == 0);
-    if (d.compute_capability_major() >= 12 && sm120_aligned) {
+    // native tensor cores, so we prefer SM120 whenever possible.
+    if (d.compute_capability_major() >= 12 && (K % 128 == 0)) {
       cute_qmm_fp4_sm120(x, w, scales, out, bits_, group_size_, enc);
       return;
     }
