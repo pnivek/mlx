@@ -254,6 +254,8 @@ void fp_qmv(
                 fp_qmv_single<T, rows_per_block, n.value, 4, 32, true>;
             if (bits == 8) {
               kernel = fp_qmv_single<T, rows_per_block, n.value, 8, 32, true>;
+            } else if (group_size == 64) {
+              kernel = fp_qmv_single<T, rows_per_block, n.value, 4, 64, true>;
             } else if (group_size == 16) {
               kernel = fp_qmv_single<T, rows_per_block, n.value, 4, 16, false>;
             }
@@ -273,6 +275,8 @@ void fp_qmv(
                 fp_qmv_batched<T, rows_per_block, n.value, 4, 32, true>;
             if (bits == 8) {
               kernel = fp_qmv_batched<T, rows_per_block, n.value, 8, 32, true>;
+            } else if (group_size == 64) {
+              kernel = fp_qmv_batched<T, rows_per_block, n.value, 4, 64, true>;
             } else if (group_size == 16) {
               kernel = fp_qmv_batched<T, rows_per_block, n.value, 4, 16, false>;
             }

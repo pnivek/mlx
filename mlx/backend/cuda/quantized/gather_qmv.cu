@@ -247,6 +247,9 @@ void fp_gather_qmv(
         if (bits == 8) {
           kernel =
               fp_gather_qmv_kernel<T, gather_rows_per_block, n_val.value, 8, 32, true>;
+        } else if (group_size == 64) {
+          kernel =
+              fp_gather_qmv_kernel<T, gather_rows_per_block, n_val.value, 4, 64, true>;
         } else if (group_size == 16) {
           kernel =
               fp_gather_qmv_kernel<T, gather_rows_per_block, n_val.value, 4, 16, false>;

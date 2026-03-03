@@ -111,6 +111,15 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
 
+  // MXFP8: dequant+cuBLAS fallback.
+  // TODO: SM120 native block-scaled GEMM disabled pending CUTLASS fixes.
+  if (transpose_ && mode_ == QuantizationMode::Mxfp8) {
+    array w_dequant = alloc_dequant_buffer(N, K, out.dtype(), enc);
+    fp_dequantize(w, scales, w_dequant, group_size_, bits_, enc, s);
+    dequant_cublas_gemm(x, w_dequant, out, M, N, K, enc);
+    return;
+  }
+
   // Affine quantization: CuTe kernel for small M (aligned), dequant+cuBLAS otherwise.
   if (transpose_ && biases && mode_ == QuantizationMode::Affine) {
     if (cute_aligned && M <= 64) {
@@ -154,11 +163,10 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   int N = out.shape(-1);
   int B = lhs_indices.size();
 
-  // Fused on-device path for FP modes during decode (small M, small B).
+  // Fused on-device path for FP modes during decode (small M).
   // Uses fp_gather_qmv which reads indices on-device — no host sync.
-  // B<=64 threshold: decode has B=num_experts_per_tok (e.g. 4), prefill has
-  // B=seq_len*num_experts which benefits from batched dequant+cuBLAS.
-  if (transpose_ && M <= 8 && B <= 64 && mode_ != QuantizationMode::Affine) {
+  // The QMV grid is (M, ceil(N/8), B) so moderate M and B are handled fine.
+  if (transpose_ && M <= 16 && B <= 256 && mode_ != QuantizationMode::Affine) {
     // Make indices contiguous (MoE produces broadcast/strided 3D indices).
     array lhs_flat = ensure_row_contiguous(lhs_indices, enc, s);
     array rhs_flat = ensure_row_contiguous(rhs_indices, enc, s);
@@ -168,7 +176,26 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
 
-  // Fallback: host-side grouping path for large M or affine mode.
+  // Fused path: on-device sort + batch dequant + CUTLASS grouped GEMM.
+  // Requires dequanting all E experts at once. Use when the dequant buffer
+  // fits comfortably (< 8 GB) and weights are fully contiguous.
+  if (transpose_ && w.flags().row_contiguous && scales.flags().row_contiguous &&
+      (!biases || biases->flags().row_contiguous)) {
+    int E = w.shape(0);
+    size_t dequant_bytes =
+        static_cast<size_t>(E) * N * K * size_of(out.dtype());
+    constexpr size_t kMaxDequantBytes = 8ULL * 1024 * 1024 * 1024; // 8 GB
+    if (dequant_bytes <= kMaxDequantBytes) {
+      gather_qmm_gpu_fused(
+          x, w, scales, biases,
+          lhs_indices, rhs_indices,
+          out, transpose_, group_size_, bits_, mode_,
+          enc, s);
+      return;
+    }
+  }
+
+  // Fallback: host-side grouping path.
   gather_qmm_gpu(
       x, w, scales, biases,
       lhs_indices, rhs_indices,
