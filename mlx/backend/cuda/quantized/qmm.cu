@@ -577,6 +577,8 @@ inline void dispatch_groups(int group_size, const char* tag, F&& f) {
     f(cute::Int<32>{});
   } else if (group_size == 64) {
     f(cute::Int<64>{});
+  } else if (group_size == 128) {
+    f(cute::Int<128>{});
   } else {
     throw std::invalid_argument(
         fmt::format("[{0}] Group size {1} is not supported.", tag, group_size));

@@ -253,11 +253,24 @@ void fp_qmv(
             auto kernel =
                 fp_qmv_single<T, rows_per_block, n.value, 4, 32, true>;
             if (bits == 8) {
-              kernel = fp_qmv_single<T, rows_per_block, n.value, 8, 32, true>;
-            } else if (group_size == 64) {
-              kernel = fp_qmv_single<T, rows_per_block, n.value, 4, 64, true>;
-            } else if (group_size == 16) {
-              kernel = fp_qmv_single<T, rows_per_block, n.value, 4, 16, false>;
+              // FP8 path: dispatch by group_size within bits=8.
+              if (group_size == 64) {
+                kernel = fp_qmv_single<T, rows_per_block, n.value, 8, 64, true>;
+              } else if (group_size == 128) {
+                kernel = fp_qmv_single<T, rows_per_block, n.value, 8, 128, true>;
+              } else { // gs=32 (default for MXFP8)
+                kernel = fp_qmv_single<T, rows_per_block, n.value, 8, 32, true>;
+              }
+            } else {
+              // FP4 path: dispatch by group_size within bits=4.
+              if (group_size == 64) {
+                kernel = fp_qmv_single<T, rows_per_block, n.value, 4, 64, true>;
+              } else if (group_size == 128) {
+                kernel = fp_qmv_single<T, rows_per_block, n.value, 4, 128, true>;
+              } else if (group_size == 16) {
+                kernel = fp_qmv_single<T, rows_per_block, n.value, 4, 16, false>;
+              }
+              // else: gs=32 default
             }
             encoder.add_kernel_node(
                 kernel,
@@ -274,11 +287,21 @@ void fp_qmv(
             auto kernel =
                 fp_qmv_batched<T, rows_per_block, n.value, 4, 32, true>;
             if (bits == 8) {
-              kernel = fp_qmv_batched<T, rows_per_block, n.value, 8, 32, true>;
-            } else if (group_size == 64) {
-              kernel = fp_qmv_batched<T, rows_per_block, n.value, 4, 64, true>;
-            } else if (group_size == 16) {
-              kernel = fp_qmv_batched<T, rows_per_block, n.value, 4, 16, false>;
+              if (group_size == 64) {
+                kernel = fp_qmv_batched<T, rows_per_block, n.value, 8, 64, true>;
+              } else if (group_size == 128) {
+                kernel = fp_qmv_batched<T, rows_per_block, n.value, 8, 128, true>;
+              } else {
+                kernel = fp_qmv_batched<T, rows_per_block, n.value, 8, 32, true>;
+              }
+            } else {
+              if (group_size == 64) {
+                kernel = fp_qmv_batched<T, rows_per_block, n.value, 4, 64, true>;
+              } else if (group_size == 128) {
+                kernel = fp_qmv_batched<T, rows_per_block, n.value, 4, 128, true>;
+              } else if (group_size == 16) {
+                kernel = fp_qmv_batched<T, rows_per_block, n.value, 4, 16, false>;
+              }
             }
             encoder.add_kernel_node(
                 kernel,

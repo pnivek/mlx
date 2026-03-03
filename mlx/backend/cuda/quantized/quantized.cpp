@@ -122,20 +122,25 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
 
-  // MXFP8: dequant+cuBLAS fallback.
-  // TODO: SM120 native block-scaled GEMM disabled pending CUTLASS fixes.
+  // MXFP8: SM120 native > dequant+cuBLAS fallback.
+  // SM120 uses m16n8k32 MMA with ue8m0 scale factors (TileShape K=64).
+  // M <= 8 already dispatched to QMV above, so SM120 handles all M >= 9.
   if (transpose_ && mode_ == QuantizationMode::Mxfp8) {
+    if (d.compute_capability_major() >= 12 && (K % 64 == 0)) {
+      cute_qmm_fp8_sm120(x, w, scales, out, group_size_, enc);
+      return;
+    }
     array w_dequant = alloc_dequant_buffer(N, K, out.dtype(), enc);
     fp_dequantize(w, scales, w_dequant, group_size_, bits_, enc, s);
     dequant_cublas_gemm(x, w_dequant, out, M, N, K, enc);
     return;
   }
 
-  // Affine quantization: CuTe kernel for small M (aligned), dequant+cuBLAS otherwise.
-  // The CuTe kernel only supports group_size <= 64 (dispatch_groups limitation).
-  // For group_size=128, fall through to dequant+cuBLAS.
+  // Affine quantization: CuTe kernel for aligned dims, dequant+cuBLAS otherwise.
+  // CuTe tiles M into BM=32 blocks with partial-tile predicates, so any M works.
+  // For very large M (>512), cuBLAS's optimized kernels may be faster, so we cap.
   if (transpose_ && biases && mode_ == QuantizationMode::Affine) {
-    if (cute_aligned && M <= 64 && group_size_ <= 64) {
+    if (cute_aligned && M <= 512) {
       cute_qmm(x, w, scales, *biases, out, bits_, group_size_, enc);
     } else {
       array w_dequant = alloc_dequant_buffer(N, K, out.dtype(), enc);

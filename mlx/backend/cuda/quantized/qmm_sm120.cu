@@ -29,6 +29,8 @@
 #include "mlx/backend/cuda/utils.h"
 #include "mlx/dtype_utils.h"
 
+#include <cuda_fp8.h>
+
 // Must include CUTLASS arch config BEFORE the guard check so the SM120/SM121
 // macros are defined when compiling for the right target.
 #include "cutlass/arch/config.h"
@@ -317,6 +319,95 @@ __global__ void quantize_activation_fp4_bf16_kernel(
   }
 }
 
+// ============================================================================
+// FP8 (e4m3) activation quantization kernel.
+//
+// Quantizes fp16/bf16 activations to FP8 (e4m3) with per-block ue8m0 scale
+// factors in CUTLASS interleaved layout. Unlike FP4, FP8 stores 1 byte per
+// element (no nibble packing).
+//
+// e4m3 representable range: ±[2^-9, 448]. Max magnitude = 448.0.
+// ============================================================================
+
+template <typename SFType, typename LayoutSF>
+__global__ void quantize_activation_fp8_kernel(
+    const __half* __restrict__ input, // (M, K) row-major
+    uint8_t* __restrict__ output,     // (M, K) FP8 e4m3 (1 byte per element)
+    SFType* __restrict__ sf_out,      // CUTLASS-format scale factors
+    LayoutSF layout_sfa,
+    int M,
+    int K,
+    int sf_vec_size) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int num_groups = K / sf_vec_size;
+  int total = M * num_groups;
+  if (idx >= total) return;
+
+  int m = idx / num_groups;
+  int g = idx % num_groups;
+  const __half* block_start = input + m * K + g * sf_vec_size;
+
+  // Compute max absolute value in block.
+  float amax = 0.0f;
+  for (int i = 0; i < sf_vec_size; i++) {
+    amax = fmaxf(amax, fabsf(__half2float(block_start[i])));
+  }
+
+  // Scale: amax / max_representable_e4m3 (448.0).
+  float scale = (amax > 0.0f) ? (amax / 448.0f) : 1.0f;
+  float inv_scale = 1.0f / scale;
+
+  // Store scale factor in CUTLASS interleaved layout.
+  auto sf_offset = layout_sfa(m, g * sf_vec_size, 0);
+  sf_out[sf_offset] = static_cast<SFType>(scale);
+
+  // Quantize: 1 byte per element (no packing).
+  int out_base = m * K + g * sf_vec_size;
+  for (int i = 0; i < sf_vec_size; i++) {
+    float v = __half2float(block_start[i]) * inv_scale;
+    __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(v);
+    output[out_base + i] = *reinterpret_cast<uint8_t*>(&fp8);
+  }
+}
+
+// BF16 variant for FP8 activation quantization.
+template <typename SFType, typename LayoutSF>
+__global__ void quantize_activation_fp8_bf16_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    uint8_t* __restrict__ output,
+    SFType* __restrict__ sf_out,
+    LayoutSF layout_sfa,
+    int M,
+    int K,
+    int sf_vec_size) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int num_groups = K / sf_vec_size;
+  int total = M * num_groups;
+  if (idx >= total) return;
+
+  int m = idx / num_groups;
+  int g = idx % num_groups;
+  const __nv_bfloat16* block_start = input + m * K + g * sf_vec_size;
+
+  float amax = 0.0f;
+  for (int i = 0; i < sf_vec_size; i++) {
+    amax = fmaxf(amax, fabsf(__bfloat162float(block_start[i])));
+  }
+
+  float scale = (amax > 0.0f) ? (amax / 448.0f) : 1.0f;
+  float inv_scale = 1.0f / scale;
+
+  auto sf_offset = layout_sfa(m, g * sf_vec_size, 0);
+  sf_out[sf_offset] = static_cast<SFType>(scale);
+
+  int out_base = m * K + g * sf_vec_size;
+  for (int i = 0; i < sf_vec_size; i++) {
+    float v = __bfloat162float(block_start[i]) * inv_scale;
+    __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(v);
+    output[out_base + i] = *reinterpret_cast<uint8_t*>(&fp8);
+  }
+}
+
 } // anonymous namespace (helper __global__ kernels)
 
 // ============================================================================
@@ -594,6 +685,104 @@ void execute_sm120_fp4_gemm(
 }
 
 // ============================================================================
+// Execute SM120 FP8 GEMM: quantize activations to FP8, reformat SFs, run GEMM.
+//
+// Same structure as execute_sm120_fp4_gemm but with FP8:
+// - x_q is M*K bytes (1 byte/element, no packing)
+// - SFVecSize=32 with ue8m0 scale factors (same as MXFP4)
+// ============================================================================
+template <typename GemmType, typename InputType>
+void execute_sm120_fp8_gemm(
+    void* kernel_ptr,
+    const array& x,      // (M, K) fp16/bf16 activation
+    const array& w,      // (N, K) packed FP8 weights
+    const array& scales, // (N, K/gs) weight scale factors
+    array& out,          // (M, N) output
+    int group_size,
+    cu::CommandEncoder& encoder) {
+  using BlkConfig = typename GemmType::Sm1xxBlkScaledConfig;
+  using LayoutSFA = typename GemmType::LayoutSFA;
+  using LayoutSFB = typename GemmType::LayoutSFB;
+  using ElementA = typename GemmType::ElementA;
+  using SFType = typename ElementA::ScaleFactorType;
+
+  int M = out.shape(-2);
+  int N = out.shape(-1);
+  int K = x.shape(-1);
+  int sf_vec_size = BlkConfig::SFVecSize;
+  int num_act_groups = M * (K / sf_vec_size);
+  int num_wt_groups = N * (K / sf_vec_size);
+
+  auto problem_shape = cute::make_shape(M, N, K, 1);
+  LayoutSFA layout_SFA = BlkConfig::tile_atom_to_shape_SFA(problem_shape);
+  LayoutSFB layout_SFB = BlkConfig::tile_atom_to_shape_SFB(problem_shape);
+
+  int sfa_size = cute::cosize(layout_SFA);
+  int sfb_size = cute::cosize(layout_SFB);
+
+  // 1. Quantized activation data: (M, K) FP8 — 1 byte per element (NOT M*K/2).
+  size_t x_q_bytes = static_cast<size_t>(M) * K;
+  auto x_q_alloc = cu::malloc_async(x_q_bytes, encoder);
+  array x_q_buf(x_q_alloc, {M, K}, uint8);
+  encoder.add_temporary(x_q_buf);
+
+  // 2. Activation scale factors in CUTLASS layout.
+  size_t sfa_bytes = static_cast<size_t>(sfa_size) * sizeof(SFType);
+  auto sfa_alloc = cu::malloc_async(sfa_bytes, encoder);
+  array sfa_buf(sfa_alloc, {sfa_size}, uint8);
+  encoder.add_temporary(sfa_buf);
+
+  // 3. Reformatted weight scale factors in CUTLASS layout.
+  size_t sfb_bytes = static_cast<size_t>(sfb_size) * sizeof(SFType);
+  auto sfb_alloc = cu::malloc_async(sfb_bytes, encoder);
+  array sfb_buf(sfb_alloc, {static_cast<int>(sfb_bytes)}, uint8);
+  encoder.add_temporary(sfb_buf);
+
+  auto& stream = encoder.stream();
+  constexpr int kThreads = 256;
+
+  // Step 1: Quantize activations to FP8 (e4m3).
+  {
+    int blocks = (num_act_groups + kThreads - 1) / kThreads;
+    if constexpr (std::is_same_v<InputType, __nv_bfloat16>) {
+      quantize_activation_fp8_bf16_kernel<<<blocks, kThreads, 0, stream>>>(
+          reinterpret_cast<const __nv_bfloat16*>(x.data<void>()),
+          reinterpret_cast<uint8_t*>(x_q_buf.data<void>()),
+          reinterpret_cast<SFType*>(sfa_buf.data<void>()),
+          layout_SFA, M, K, sf_vec_size);
+    } else {
+      quantize_activation_fp8_kernel<<<blocks, kThreads, 0, stream>>>(
+          reinterpret_cast<const __half*>(x.data<void>()),
+          reinterpret_cast<uint8_t*>(x_q_buf.data<void>()),
+          reinterpret_cast<SFType*>(sfa_buf.data<void>()),
+          layout_SFA, M, K, sf_vec_size);
+    }
+  }
+
+  // Step 2: Reformat weight scale factors from row-major to CUTLASS layout.
+  {
+    int wt_groups_per_row = K / group_size;
+    int blocks = (num_wt_groups + kThreads - 1) / kThreads;
+    reformat_sf_kernel<<<blocks, kThreads, 0, stream>>>(
+        reinterpret_cast<const SFType*>(scales.data<void>()),
+        reinterpret_cast<SFType*>(sfb_buf.data<void>()),
+        layout_SFB, N, wt_groups_per_row, sf_vec_size);
+  }
+
+  // Step 3: Run CUTLASS block-scaled GEMM.
+  // FP8 weight data stored as (N, K) row-major — K contiguous, same as FP4.
+  run_sm120_gemm<GemmType>(
+      kernel_ptr,
+      M, N, K,
+      x_q_buf.data<void>(),
+      sfa_buf.data<void>(),
+      w.data<void>(),
+      sfb_buf.data<void>(),
+      out.data<void>(),
+      encoder);
+}
+
+// ============================================================================
 // Public API: SM120 native FP4 quantized matmul.
 //
 // Takes fp16/bf16 activations, packed FP4 weights, and fp16 weight scale
@@ -631,6 +820,17 @@ using MxFP4_BF16_Gemm = Sm120BlockScaledGemm<
 using MxFP4_FP16_Gemm = Sm120BlockScaledGemm<
     cutlass::mx_float4_t<cutlass::float_e2m1_t>,
     cutlass::half_t, 32, 32, Sm120FP4TileShape>;
+
+// Tile shape for SM120 FP8 GEMM: K=64 (half of FP4's K=128 since FP8 is 2x wider).
+using Sm120FP8TileShape = cute::Shape<cute::_128, cute::_128, cute::_64>;
+
+// MXFP8: mx_float8_t with ue8m0 scale factors, SFVecSize=32.
+using MxFP8_BF16_Gemm = Sm120BlockScaledGemm<
+    cutlass::mx_float8_t<cutlass::float_e4m3_t>,
+    cutlass::bfloat16_t, 32, 32, Sm120FP8TileShape>;
+using MxFP8_FP16_Gemm = Sm120BlockScaledGemm<
+    cutlass::mx_float8_t<cutlass::float_e4m3_t>,
+    cutlass::half_t, 32, 32, Sm120FP8TileShape>;
 
 // Non-template helper: configure kernel and return void* pointer.
 // Each variant is a separate non-template function to ensure consistent
@@ -693,6 +893,38 @@ static void* get_configured_kernel_mxfp4_fp16() {
     if (err != cudaSuccess) {
       throw std::runtime_error(fmt::format(
           "[qmm_sm120] cudaFuncSetAttribute failed for mxfp4_fp16: {} (smem={}B)",
+          cudaGetErrorString(err), smem));
+    }
+  }
+  return ptr;
+}
+
+static void* get_configured_kernel_mxfp8_bf16() {
+  using GemmKernel = MxFP8_BF16_Gemm::Gemm::GemmKernel;
+  void* ptr = (void*)sm120_gemm_kernel<GemmKernel>;
+  int smem = GemmKernel::SharedStorageSize;
+  if (smem >= (48 << 10)) {
+    cudaError_t err = cudaFuncSetAttribute(
+        ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(fmt::format(
+          "[qmm_sm120] cudaFuncSetAttribute failed for mxfp8_bf16: {} (smem={}B)",
+          cudaGetErrorString(err), smem));
+    }
+  }
+  return ptr;
+}
+
+static void* get_configured_kernel_mxfp8_fp16() {
+  using GemmKernel = MxFP8_FP16_Gemm::Gemm::GemmKernel;
+  void* ptr = (void*)sm120_gemm_kernel<GemmKernel>;
+  int smem = GemmKernel::SharedStorageSize;
+  if (smem >= (48 << 10)) {
+    cudaError_t err = cudaFuncSetAttribute(
+        ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(fmt::format(
+          "[qmm_sm120] cudaFuncSetAttribute failed for mxfp8_fp16: {} (smem={}B)",
           cudaGetErrorString(err), smem));
     }
   }
@@ -827,7 +1059,36 @@ void cute_qmm_fp4_sm120(
 
 // ============================================================================
 // Public API: SM120 native FP8 quantized matmul (MXFP8).
+//
+// Uses mx_float8_t<float_e4m3_t> with ue8m0 scale factors, SFVecSize=32.
+// TileShape=128x128x64 (half K of FP4 since FP8 is 2x wider per element).
+// Activations are quantized on-the-fly to FP8 with per-block scale factors.
 // ============================================================================
+
+// Helper: dispatch to the correct execute_sm120_fp8_gemm variant.
+static void dispatch_sm120_fp8(
+    const array& x,
+    const array& w,
+    const array& scales,
+    array& out,
+    int group_size,
+    cu::CommandEncoder& encoder) {
+  const char* tag = "[qmm_fp8_sm120]";
+
+  if (out.dtype() == bfloat16) {
+    void* kernel_ptr = get_configured_kernel_mxfp8_bf16();
+    execute_sm120_fp8_gemm<MxFP8_BF16_Gemm, __nv_bfloat16>(
+        kernel_ptr, x, w, scales, out, group_size, encoder);
+  } else if (out.dtype() == float16) {
+    void* kernel_ptr = get_configured_kernel_mxfp8_fp16();
+    execute_sm120_fp8_gemm<MxFP8_FP16_Gemm, __half>(
+        kernel_ptr, x, w, scales, out, group_size, encoder);
+  } else {
+    throw std::runtime_error(
+        fmt::format("{} Unsupported dtype for SM120 MXFP8 GEMM.", tag));
+  }
+}
+
 void cute_qmm_fp8_sm120(
     const array& x,
     const array& w,
@@ -835,11 +1096,58 @@ void cute_qmm_fp8_sm120(
     array& out,
     int group_size,
     cu::CommandEncoder& encoder) {
-  // TODO: Implement MXFP8 path.
-  // Similar to FP4 but with mx_float8_t<float_e4m3_t>, SFVecSize=32,
-  // TileShape=128x128x64, and FP8 activation quantization.
-  throw std::runtime_error(
-      "[qmm_fp8_sm120] MXFP8 SM120 native GEMM not yet implemented.");
+  const char* tag = "[qmm_fp8_sm120]";
+  int M = out.shape(-2);
+  int N = out.shape(-1);
+  int K = x.shape(-1);
+
+  encoder.set_input_array(x);
+  encoder.set_input_array(w);
+  encoder.set_input_array(scales);
+  encoder.set_output_array(out);
+
+  // N-padding for TMA alignment (same pattern as FP4).
+  int N_padded = (N + 127) / 128 * 128;
+  bool needs_n_pad = (N_padded != N);
+
+  if (needs_n_pad) {
+    auto& stream = encoder.stream();
+    size_t elem_size = size_of(out.dtype());
+
+    // FP8 weights: (N, K) — 1 byte per element.
+    int w_cols = w.shape(-1);
+    array w_pad({N_padded, w_cols}, w.dtype(), nullptr, {});
+    w_pad.set_data(cu::malloc_async(w_pad.nbytes(), encoder));
+    encoder.add_temporary(w_pad);
+    cudaMemsetAsync(w_pad.data<void>(), 0, w_pad.nbytes(), stream);
+    cudaMemcpyAsync(
+        w_pad.data<void>(), w.data<void>(), w.nbytes(),
+        cudaMemcpyDeviceToDevice, stream);
+
+    int s_cols = scales.shape(-1);
+    array s_pad({N_padded, s_cols}, scales.dtype(), nullptr, {});
+    s_pad.set_data(cu::malloc_async(s_pad.nbytes(), encoder));
+    encoder.add_temporary(s_pad);
+    cudaMemsetAsync(s_pad.data<void>(), 0, s_pad.nbytes(), stream);
+    cudaMemcpyAsync(
+        s_pad.data<void>(), scales.data<void>(), scales.nbytes(),
+        cudaMemcpyDeviceToDevice, stream);
+
+    array out_pad({M, N_padded}, out.dtype(), nullptr, {});
+    out_pad.set_data(cu::malloc_async(out_pad.nbytes(), encoder));
+    encoder.add_temporary(out_pad);
+
+    dispatch_sm120_fp8(x, w_pad, s_pad, out_pad, group_size, encoder);
+
+    cudaMemcpy2DAsync(
+        out.data<void>(), N * elem_size,
+        out_pad.data<void>(), N_padded * elem_size,
+        N * elem_size, M,
+        cudaMemcpyDeviceToDevice, stream);
+    return;
+  }
+
+  dispatch_sm120_fp8(x, w, scales, out, group_size, encoder);
 }
 
 } // namespace mlx::core

@@ -245,14 +245,27 @@ void fp_gather_qmv(
         auto kernel =
             fp_gather_qmv_kernel<T, gather_rows_per_block, n_val.value, 4, 32, true>;
         if (bits == 8) {
-          kernel =
-              fp_gather_qmv_kernel<T, gather_rows_per_block, n_val.value, 8, 32, true>;
-        } else if (group_size == 64) {
-          kernel =
-              fp_gather_qmv_kernel<T, gather_rows_per_block, n_val.value, 4, 64, true>;
-        } else if (group_size == 16) {
-          kernel =
-              fp_gather_qmv_kernel<T, gather_rows_per_block, n_val.value, 4, 16, false>;
+          if (group_size == 64) {
+            kernel =
+                fp_gather_qmv_kernel<T, gather_rows_per_block, n_val.value, 8, 64, true>;
+          } else if (group_size == 128) {
+            kernel =
+                fp_gather_qmv_kernel<T, gather_rows_per_block, n_val.value, 8, 128, true>;
+          } else {
+            kernel =
+                fp_gather_qmv_kernel<T, gather_rows_per_block, n_val.value, 8, 32, true>;
+          }
+        } else {
+          if (group_size == 64) {
+            kernel =
+                fp_gather_qmv_kernel<T, gather_rows_per_block, n_val.value, 4, 64, true>;
+          } else if (group_size == 128) {
+            kernel =
+                fp_gather_qmv_kernel<T, gather_rows_per_block, n_val.value, 4, 128, true>;
+          } else if (group_size == 16) {
+            kernel =
+                fp_gather_qmv_kernel<T, gather_rows_per_block, n_val.value, 4, 16, false>;
+          }
         }
         encoder.add_kernel_node(
             kernel,
