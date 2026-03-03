@@ -377,10 +377,10 @@ void fp_qmv(
           if (!batched.value) {
             // Persistent QMV for M=1: shared memory activation + contiguous
             // row assignment per SM for sequential DRAM access.
-            // Only beneficial when weights exceed L2 cache (~16MB on SM121);
+            // Only beneficial when weights exceed L2 cache (24MB on SM121);
             // smaller shapes benefit from the original kernel's higher
             // occupancy since data is served from L2 at much higher BW.
-            constexpr size_t kPersistentThreshold = 16 * 1024 * 1024;
+            constexpr size_t kPersistentThreshold = 24 * 1024 * 1024;
             if (M == 1 && mat.nbytes() > kPersistentThreshold &&
                 K * int(sizeof(T)) <= 98304) {
               static int num_sms = 0;
