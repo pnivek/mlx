@@ -265,7 +265,7 @@ void CommandEncoder::add_kernel_node(
     dim3 block_dim,
     uint32_t smem_bytes,
     void** params) {
-  if (!use_cuda_graphs()) {
+  if (!use_cuda_graphs() || direct_launch_) {
     node_count_++;
     CHECK_CUDA_ERROR(cudaLaunchKernel(
         func, grid_dim, block_dim, params, smem_bytes, stream()));
@@ -286,7 +286,7 @@ void CommandEncoder::add_kernel_node(
     dim3 block_dim,
     uint32_t smem_bytes,
     void** params) {
-  if (!use_cuda_graphs()) {
+  if (!use_cuda_graphs() || direct_launch_) {
     node_count_++;
     CHECK_CUDA_ERROR(cuLaunchKernel(
         func,

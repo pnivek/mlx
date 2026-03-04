@@ -86,6 +86,23 @@ class CommandEncoder {
   bool needs_commit();
   void commit();
 
+  // Force current graph to be instantiated fresh instead of updating a cached
+  // graph exec. Use this when cudaGraphExecUpdate produces incorrect results
+  // (e.g. SM121/CUDA 13.0 with variable-size grid dims).
+  void disable_graph_update() {
+    is_graph_updatable_ = false;
+  }
+
+  // Bypass CUDA graph capture and launch kernels directly on the stream.
+  // Use after synchronize() when graph interactions cause issues.
+  // Caller must call end_direct_launch() when done.
+  void begin_direct_launch() {
+    direct_launch_ = true;
+  }
+  void end_direct_launch() {
+    direct_launch_ = false;
+  }
+
   Device& device() {
     return device_;
   }
@@ -120,6 +137,7 @@ class CommandEncoder {
   Worker worker_;
   int node_count_{0};
   bool in_concurrent_{false};
+  bool direct_launch_{false};
   std::vector<cudaGraphNode_t> from_nodes_;
   std::vector<cudaGraphNode_t> to_nodes_;
   std::string graph_nodes_key_;

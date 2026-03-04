@@ -198,16 +198,42 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   int N = out.shape(-1);
   int B = lhs_indices.size();
 
-  // Fused on-device path for FP modes during decode (small M).
-  // Uses fp_gather_qmv which reads indices on-device — no host sync.
-  // The QMV grid is (M, ceil(N/8), B) so moderate M and B are handled fine.
-  if (transpose_ && M <= 16 && B <= 256 && mode_ != QuantizationMode::Affine) {
+  // Fused on-device QMV path for FP modes during decode (small M).
+  // Reads quantized weights directly — no dequant buffer needed.
+  // Small B: unsorted QMV (low overhead).
+  // Large B: sort indices by expert for L2 locality, then QMV + scatter.
+  if (transpose_ && M <= 16 && mode_ != QuantizationMode::Affine) {
     // Make indices contiguous (MoE produces broadcast/strided 3D indices).
     array lhs_flat = ensure_row_contiguous(lhs_indices, enc, s);
     array rhs_flat = ensure_row_contiguous(rhs_indices, enc, s);
-    cu::fp_gather_qmv(
-        w, scales, x, lhs_flat, rhs_flat, out,
-        bits_, group_size_, M, N, K, B, enc);
+
+    if (B <= 256) {
+      // Small B: direct QMV, no sort needed.
+      cu::fp_gather_qmv(
+          w, scales, x, lhs_flat, rhs_flat, out,
+          bits_, group_size_, M, N, K, B, enc);
+    } else {
+      // Large B: sort by expert for L2 weight reuse, QMV into temp, scatter.
+      // Avoids dequanting all E experts (e.g. DSv3 = 5.16 GB FP16 buffer).
+      // Use direct kernel launches (bypass CUDA graph) to work around
+      // cudaGraphExecUpdate issues on SM121/CUDA 13.0.
+      enc.commit();
+      enc.begin_direct_launch();
+      int E = w.shape(0);
+      auto sorted = sort_gather_indices(lhs_flat, rhs_flat, B, E, enc, s);
+
+      // Allocate temp output in sorted order.
+      array temp_out(out.shape(), out.dtype(), nullptr, {});
+      temp_out.set_data(cu::malloc_async(out.nbytes(), enc));
+      enc.add_temporary(temp_out);
+
+      cu::fp_gather_qmv(
+          w, scales, x, sorted.sorted_lhs, sorted.sorted_rhs, temp_out,
+          bits_, group_size_, M, N, K, B, enc);
+
+      scatter_gather_output(temp_out, sorted.sorted_perm, out, B, M, N, enc);
+      enc.end_direct_launch();
+    }
     return;
   }
 
