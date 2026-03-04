@@ -822,10 +822,14 @@ void execute_sm120_fp4_gemm(
   encoder.add_temporary(x_q_buf);
 
   // 2. Activation scale factors in CUTLASS layout.
+  // MUST zero-init: TMA loads full 128-row tiles of scale factors even when
+  // M < 128. Uninitialized bytes for padded positions would be interpreted as
+  // garbage scale factors, contaminating MMA accumulation with NaN/Inf.
   size_t sfa_bytes = static_cast<size_t>(sfa_size) * sizeof(SFType);
   auto sfa_alloc = cu::malloc_async(sfa_bytes, encoder);
   array sfa_buf(sfa_alloc, {sfa_size}, uint8);
   encoder.add_temporary(sfa_buf);
+  cudaMemsetAsync(sfa_buf.data<void>(), 0, sfa_bytes, encoder.stream());
 
   // NOTE: No weight transpose needed! CUTLASS ColumnMajor B with
   // TagToStrideB<ColumnMajor> = Stride<int64_t, _1, int64_t> gives
@@ -919,10 +923,12 @@ void execute_sm120_fp8_gemm(
   encoder.add_temporary(x_q_buf);
 
   // 2. Activation scale factors in CUTLASS layout.
+  // Zero-init for same reason as FP4: TMA loads full 128-row tiles.
   size_t sfa_bytes = static_cast<size_t>(sfa_size) * sizeof(SFType);
   auto sfa_alloc = cu::malloc_async(sfa_bytes, encoder);
   array sfa_buf(sfa_alloc, {sfa_size}, uint8);
   encoder.add_temporary(sfa_buf);
+  cudaMemsetAsync(sfa_buf.data<void>(), 0, sfa_bytes, encoder.stream());
 
   auto& stream = encoder.stream();
   constexpr int kThreads = 256;
