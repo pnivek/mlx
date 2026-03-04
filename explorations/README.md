@@ -80,6 +80,23 @@ widening to FP32.
 | `qmv.cu` | FP16 accum in `fp_qmv_impl` + `fp_qmv_persistent`, conditional n=8 dispatch |
 | `gather_qmv.cu` | FP16 accum in `gather_qmv_impl`, reverted to n=4 max |
 
+## MXFP4 Dispatch Investigation (2026-03-04)
+
+bench_qmm.py showed MXFP4 0.86x at M=64 (slower than dense). Investigation with proper
+timing (10 trials × 100 iters, median) showed this was a **measurement artifact**:
+
+| M | NVFP4 vs Dense | MXFP4 vs Dense |
+|---|---|---|
+| 1 | 1.96x | 2.28x |
+| 8 | 2.37x | 2.26x |
+| 64 | 1.60x | **1.74x** (was "0.86x") |
+| 256 | 2.01x | 2.02x |
+| 1024 | 2.41x | 2.39x |
+
+**Conclusion:** MXFP4 dispatch is correct. No M-threshold needed. The erratic numbers
+were from bench_qmm.py's poor methodology (mean of 20 iters, no trials). Fixed benchmark
+now uses median of 10 trials × 50 iters.
+
 ## Remaining Opportunity
 
 **Shared memory activation for non-persistent kernel** could further improve L2-cached

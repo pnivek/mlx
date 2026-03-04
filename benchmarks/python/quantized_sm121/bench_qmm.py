@@ -2,8 +2,9 @@
 """
 Benchmark script for MLX quantized matmul kernels on CUDA (GB10 / DGX Spark).
 
-Adapted from IST-DASLab/marlin bench.py (https://github.com/IST-DASLab/marlin):
-measures TFLOP/s, GB/s, and effective speedup for each kernel dispatch path.
+Methodology: 10 trials of 50 iterations each, reports median.
+Each iteration calls mx.eval() to force discrete kernel execution.
+DRAM BW% column assumes 273 GB/s sustained (DGX Spark LPDDR5x).
 
 Usage:
     python bench_qmm.py              # run all benchmarks
@@ -21,9 +22,11 @@ import numpy as np
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-WARMUP = 5
-ITERS = 20
-COOLDOWN = 0.3  # seconds between benchmarks
+WARMUP = 20
+TRIALS = 10
+ITERS_PER_TRIAL = 50
+COOLDOWN = 0.1  # seconds between benchmarks
+DRAM_BW_GBS = 273  # DGX Spark sustained DRAM BW (GB/s)
 
 # DeepSeek V3.1 MoE layer dimensions
 DSV3_K = 7168
@@ -84,30 +87,29 @@ def bench_quantized_matmul(M, K, N, mode_cfg, dtype=mx.float16):
     x = mx.random.normal(shape=(M, K)).astype(dtype)
     mx.eval(x)
 
-    # Warmup
+    def run_once():
+        if mode == "affine":
+            y = mx.quantized_matmul(x, w_q, scales, biases, transpose=True,
+                                     group_size=gs, bits=bits)
+        else:
+            y = mx.quantized_matmul(x, w_q, scales, transpose=True,
+                                     group_size=gs, bits=bits, mode=mode)
+        mx.eval(y)
+
     for _ in range(WARMUP):
-        if mode == "affine":
-            y = mx.quantized_matmul(x, w_q, scales, biases, transpose=True,
-                                     group_size=gs, bits=bits)
-        else:
-            y = mx.quantized_matmul(x, w_q, scales, transpose=True,
-                                     group_size=gs, bits=bits, mode=mode)
-        mx.eval(y)
+        run_once()
 
-    # Timed iterations
-    mx.synchronize()
-    t0 = time.perf_counter()
-    for _ in range(ITERS):
-        if mode == "affine":
-            y = mx.quantized_matmul(x, w_q, scales, biases, transpose=True,
-                                     group_size=gs, bits=bits)
-        else:
-            y = mx.quantized_matmul(x, w_q, scales, transpose=True,
-                                     group_size=gs, bits=bits, mode=mode)
-        mx.eval(y)
-    mx.synchronize()
-    elapsed = (time.perf_counter() - t0) / ITERS
+    trial_times = []
+    for _ in range(TRIALS):
+        mx.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(ITERS_PER_TRIAL):
+            run_once()
+        mx.synchronize()
+        trial_times.append((time.perf_counter() - t0) / ITERS_PER_TRIAL)
 
+    trial_times.sort()
+    elapsed = trial_times[len(trial_times) // 2]  # median
     return elapsed, tflops(M, N, K, elapsed), gbps(M, N, K, bits, elapsed)
 
 
@@ -121,13 +123,18 @@ def bench_dense_matmul(M, K, N, dtype=mx.float16):
         y = x @ w.T
         mx.eval(y)
 
-    mx.synchronize()
-    t0 = time.perf_counter()
-    for _ in range(ITERS):
-        y = x @ w.T
-        mx.eval(y)
-    mx.synchronize()
-    elapsed = (time.perf_counter() - t0) / ITERS
+    trial_times = []
+    for _ in range(TRIALS):
+        mx.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(ITERS_PER_TRIAL):
+            y = x @ w.T
+            mx.eval(y)
+        mx.synchronize()
+        trial_times.append((time.perf_counter() - t0) / ITERS_PER_TRIAL)
+
+    trial_times.sort()
+    elapsed = trial_times[len(trial_times) // 2]  # median
     return elapsed, tflops(M, N, K, elapsed)
 
 
@@ -169,37 +176,33 @@ def bench_gather_qmm(M, K, N, E, topk, mode_cfg, dtype=mx.float16):
     lhs_idx = mx.broadcast_to(mx.arange(B).reshape(-1, 1), (B, topk)).astype(mx.uint32)
     mx.eval(rhs_idx, lhs_idx)
 
-    # Warmup
+    def run_once():
+        if mode == "affine":
+            y = mx.gather_qmm(x, w_q, scales, biases,
+                               lhs_indices=lhs_idx, rhs_indices=rhs_idx,
+                               transpose=True, group_size=gs, bits=bits)
+        else:
+            y = mx.gather_qmm(x, w_q, scales,
+                               lhs_indices=lhs_idx, rhs_indices=rhs_idx,
+                               transpose=True, group_size=gs, bits=bits,
+                               mode=mode)
+        mx.eval(y)
+
     for _ in range(WARMUP):
-        if mode == "affine":
-            y = mx.gather_qmm(x, w_q, scales, biases,
-                               lhs_indices=lhs_idx, rhs_indices=rhs_idx,
-                               transpose=True, group_size=gs, bits=bits)
-        else:
-            y = mx.gather_qmm(x, w_q, scales,
-                               lhs_indices=lhs_idx, rhs_indices=rhs_idx,
-                               transpose=True, group_size=gs, bits=bits,
-                               mode=mode)
-        mx.eval(y)
+        run_once()
 
-    # Timed
-    mx.synchronize()
-    t0 = time.perf_counter()
-    for _ in range(ITERS):
-        if mode == "affine":
-            y = mx.gather_qmm(x, w_q, scales, biases,
-                               lhs_indices=lhs_idx, rhs_indices=rhs_idx,
-                               transpose=True, group_size=gs, bits=bits)
-        else:
-            y = mx.gather_qmm(x, w_q, scales,
-                               lhs_indices=lhs_idx, rhs_indices=rhs_idx,
-                               transpose=True, group_size=gs, bits=bits,
-                               mode=mode)
-        mx.eval(y)
-    mx.synchronize()
-    elapsed = (time.perf_counter() - t0) / ITERS
+    trial_times = []
+    for _ in range(TRIALS):
+        mx.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(ITERS_PER_TRIAL):
+            run_once()
+        mx.synchronize()
+        trial_times.append((time.perf_counter() - t0) / ITERS_PER_TRIAL)
 
-    # Effective FLOPS: B * topk * 2 * N * K
+    trial_times.sort()
+    elapsed = trial_times[len(trial_times) // 2]  # median
+
     effective_flops = 2.0 * B * topk * N * K
     eff_tflops = effective_flops / elapsed / 1e12
     return elapsed, eff_tflops
@@ -220,8 +223,8 @@ def run_qmm_benchmarks():
     for model_name, dims in MODELS.items():
         K, N = dims["K"], dims["N"]
         print(f"\n--- {model_name} (K={K}, N={N}) ---")
-        print(f"{'Mode':<14} {'M':>5}  {'Time(ms)':>10}  {'TFLOP/s':>9}  {'GB/s':>8}  {'vs Dense':>9}")
-        print("-" * 70)
+        print(f"{'Mode':<14} {'M':>5}  {'Time(ms)':>10}  {'TFLOP/s':>9}  {'GB/s':>8}  {'%DRAM':>6}  {'vs Dense':>9}")
+        print("-" * 76)
 
         for M in batch_sizes:
             # Dense reference
@@ -231,7 +234,8 @@ def run_qmm_benchmarks():
                 try:
                     t, tf, bw = bench_quantized_matmul(M, K, N, mcfg)
                     speedup = dense_t / t
-                    print(f"{mcfg['label']:<14} {M:>5}  {t*1000:>10.3f}  {tf:>9.2f}  {bw:>8.1f}  {speedup:>8.2f}x")
+                    pct_dram = bw / DRAM_BW_GBS * 100
+                    print(f"{mcfg['label']:<14} {M:>5}  {t*1000:>10.3f}  {tf:>9.2f}  {bw:>8.1f}  {pct_dram:>5.0f}%  {speedup:>8.2f}x")
                 except Exception as e:
                     print(f"{mcfg['label']:<14} {M:>5}  {'ERROR':>10}  {str(e)[:30]}")
 
@@ -280,15 +284,16 @@ def run_sweep():
     mcfg = {"mode": "affine", "bits": 4, "group_size": 64, "label": "INT4-gs64"}
 
     batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
-    print(f"{'M':>6}  {'Quant(ms)':>10}  {'Dense(ms)':>10}  {'TFLOP/s':>9}  {'GB/s':>8}  {'Speedup':>8}")
-    print("-" * 65)
+    print(f"{'M':>6}  {'Quant(ms)':>10}  {'Dense(ms)':>10}  {'TFLOP/s':>9}  {'GB/s':>8}  {'%DRAM':>6}  {'Speedup':>8}")
+    print("-" * 72)
 
     for M in batch_sizes:
         try:
             dense_t, dense_tf = bench_dense_matmul(M, K, N)
             qt, qtf, qbw = bench_quantized_matmul(M, K, N, mcfg)
             speedup = dense_t / qt
-            print(f"{M:>6}  {qt*1000:>10.3f}  {dense_t*1000:>10.3f}  {qtf:>9.2f}  {qbw:>8.1f}  {speedup:>7.2f}x")
+            pct_dram = qbw / DRAM_BW_GBS * 100
+            print(f"{M:>6}  {qt*1000:>10.3f}  {dense_t*1000:>10.3f}  {qtf:>9.2f}  {qbw:>8.1f}  {pct_dram:>5.0f}%  {speedup:>7.2f}x")
         except Exception as e:
             print(f"{M:>6}  ERROR: {e}")
         time.sleep(COOLDOWN)
@@ -304,6 +309,7 @@ def main():
     # Print system info
     print(f"MLX version: {mx.__version__}")
     print(f"Default device: {mx.default_device()}")
+    print(f"Methodology: median of {TRIALS} trials x {ITERS_PER_TRIAL} iters, {WARMUP} warmup")
 
     # If no flags, run everything
     run_all = not (args.qmm or args.gather or args.sweep)
