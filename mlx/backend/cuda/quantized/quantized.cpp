@@ -94,10 +94,28 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   // CuTe kernel alignment requirements.
   bool cute_aligned = (N % 128 == 0) && (K % 64 == 0);
 
-  // FP quantization modes (MXFP4, NVFP4, MXFP8): use QMV for small M.
-  if (transpose_ && M <= 8 && mode_ != QuantizationMode::Affine) {
-    fp_qmv(w, scales, x, out, bits_, group_size_, M, N, K, enc);
-    return;
+  // FP quantization modes: QMV dispatch for small M.
+  // FP4 QMV at M>8 re-reads weight matrix M times; SM120 GEMM reads once.
+  // FP4: QMV only for M<=8 (SM120 GEMM wins at M=16 even on small models).
+  // FP8: SM120 GEMM has 2× MMA ops + 2× activation buffer vs FP4, so its
+  // pipeline overhead is much worse at small M. On small matrices (N*K < 32M),
+  // FP8 QMV beats SM120 GEMM through M=16 (Llama-7B: 0.92x vs 0.42x).
+  if (transpose_ && mode_ != QuantizationMode::Affine) {
+    int qmv_threshold = 8;
+
+    if (d.compute_capability_major() >= 12 &&
+        mode_ == QuantizationMode::Mxfp8) {
+      int64_t mat_elems = static_cast<int64_t>(N) * K;
+      constexpr int64_t kSmallMatrix = 32LL * 1024 * 1024;
+      if (mat_elems < kSmallMatrix) {
+        qmv_threshold = 16;
+      }
+    }
+
+    if (M <= qmv_threshold) {
+      fp_qmv(w, scales, x, out, bits_, group_size_, M, N, K, enc);
+      return;
+    }
   }
 
   // MXFP4 / NVFP4: SM120 native > CuTe dequant > dequant+cuBLAS.
@@ -119,9 +137,9 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   // MXFP8: SM120 native > dequant+cuBLAS fallback.
   // SM120 uses m16n8k32 MMA with ue8m0 scale factors (TileShape K=128).
-  // M <= 8 already dispatched to QMV above. SM120 native beats
-  // dequant+cuBLAS up to ~M=2048 (avoids N*K FP16 dequant buffer +
-  // separate dequant kernel). At M>=4096 cuBLAS wins due to better tiling.
+  // Small-M QMV already dispatched above (M<=8, or M<=16 for small matrices).
+  // SM120 native beats dequant+cuBLAS through M=2048 — avoids N*K FP16
+  // dequant buffer + separate dequant kernel. At M>=4096 cuBLAS wins.
   if (transpose_ && mode_ == QuantizationMode::Mxfp8) {
     if (d.compute_capability_major() >= 12 && (K % 128 == 0) && M <= 2048) {
       cute_qmm_fp8_sm120(x, w, scales, out, group_size_, enc);

@@ -218,7 +218,7 @@ def run_qmm_benchmarks():
     """Run QuantizedMatmul benchmarks across model sizes and quant modes."""
     print_header("QuantizedMatmul Benchmarks")
 
-    batch_sizes = [1, 4, 16, 64, 256, 1024, 4096]
+    batch_sizes = [1, 4, 16, 32, 64, 256, 1024, 4096]
 
     for model_name, dims in MODELS.items():
         K, N = dims["K"], dims["N"]
