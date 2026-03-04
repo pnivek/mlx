@@ -29,4 +29,8 @@ void cute_qmm_fp8_sm120(
     int group_size,
     cu::CommandEncoder& encoder);
 
+// Clear cached reformatted weight scale factors.
+// Call when unloading a model to free GPU memory.
+void clear_sm120_sf_cache();
+
 } // namespace mlx::core

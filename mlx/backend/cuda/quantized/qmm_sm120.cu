@@ -40,6 +40,9 @@
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || \
     defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
 
+#include <mutex>
+#include <unordered_map>
+
 #include "cutlass/cutlass.h"
 #include "cute/tensor.hpp"
 #include "cutlass/gemm/dispatch_policy.hpp"
@@ -169,6 +172,44 @@ void sm120_gemm_kernel(CUTLASS_GRID_CONSTANT typename GemmKernel::Params const p
 namespace {
 
 // ============================================================================
+// Cache for reformatted weight scale factors (CUTLASS interleaved layout).
+//
+// Weight SFs are reformatted from row-major to CUTLASS TMA layout by
+// reformat_sf_kernel. This layout depends only on (N, K, group_size), NOT on M.
+// Since weights are static during inference, we cache the reformatted SFs
+// and skip the reformat kernel (~64 µs FP4, ~33 µs FP8) on all subsequent calls.
+//
+// Key: (raw_scales_ptr, N, K, group_size) — uniquely identifies a weight config.
+// MLX quantized weights are persistent; their device pointers are stable.
+// ============================================================================
+struct SFBCacheKey {
+  const void* scales_ptr;
+  int N, K, group_size;
+  bool operator==(const SFBCacheKey& o) const {
+    return scales_ptr == o.scales_ptr && N == o.N && K == o.K &&
+        group_size == o.group_size;
+  }
+};
+
+struct SFBCacheKeyHash {
+  size_t operator()(const SFBCacheKey& k) const {
+    size_t h = std::hash<const void*>{}(k.scales_ptr);
+    h ^= std::hash<int>{}(k.N) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    h ^= std::hash<int>{}(k.K) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    h ^= std::hash<int>{}(k.group_size) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    return h;
+  }
+};
+
+struct SFBCacheEntry {
+  void* device_ptr;
+  size_t size_bytes;
+};
+
+static std::unordered_map<SFBCacheKey, SFBCacheEntry, SFBCacheKeyHash> sfb_cache;
+static std::mutex sfb_cache_mutex;
+
+// ============================================================================
 // Scale factor reformatting kernel.
 //
 // Copies weight scale factors from MLX format (SFType, row-major) to
@@ -200,6 +241,73 @@ __global__ void reformat_sf_kernel(
   // means they share one scale factor. We address at g * sf_vec_size.
   auto offset = layout_sf(row, g * sf_vec_size, 0);
   dst[offset] = scale_val;
+}
+
+// Returns a device pointer to reformatted weight SFs in CUTLASS layout.
+// On first call for a given (scales, N, K, gs), launches reformat_sf_kernel
+// and caches the result. Subsequent calls return the cached pointer directly,
+// eliminating the ~64 µs (FP4) / ~33 µs (FP8) reformat overhead.
+template <typename GemmType>
+static void* get_or_reformat_sfb(
+    const void* raw_scales,
+    int N,
+    int K,
+    int group_size,
+    cudaStream_t stream) {
+  using BlkConfig = typename GemmType::Sm1xxBlkScaledConfig;
+  using LayoutSFB = typename GemmType::LayoutSFB;
+  using ElementA = typename GemmType::ElementA;
+  using SFType = typename ElementA::ScaleFactorType;
+
+  SFBCacheKey key{raw_scales, N, K, group_size};
+
+  {
+    std::lock_guard<std::mutex> lock(sfb_cache_mutex);
+    auto it = sfb_cache.find(key);
+    if (it != sfb_cache.end()) {
+      return it->second.device_ptr;
+    }
+  }
+
+  // Cache miss — compute layout, allocate, reformat.
+  int sf_vec_size = BlkConfig::SFVecSize;
+  int num_wt_groups = N * (K / sf_vec_size);
+  // M=1 placeholder: layout_SFB depends only on (N, K, BlkConfig), not M.
+  auto problem_shape = cute::make_shape(1, N, K, 1);
+  LayoutSFB layout_SFB = BlkConfig::tile_atom_to_shape_SFB(problem_shape);
+  int sfb_size = cute::cosize(layout_SFB);
+  size_t sfb_bytes = static_cast<size_t>(sfb_size) * sizeof(SFType);
+
+  // Persistent allocation (outlives any single encoder/stream).
+  void* sfb_ptr = nullptr;
+  cudaError_t err = cudaMalloc(&sfb_ptr, sfb_bytes);
+  if (err != cudaSuccess) {
+    throw std::runtime_error(
+        "[qmm_sm120] cudaMalloc failed for SFB cache entry");
+  }
+
+  constexpr int kThreads = 256;
+  int wt_groups_per_row = K / group_size;
+  int blocks = (num_wt_groups + kThreads - 1) / kThreads;
+  reformat_sf_kernel<<<blocks, kThreads, 0, stream>>>(
+      reinterpret_cast<const SFType*>(raw_scales),
+      reinterpret_cast<SFType*>(sfb_ptr),
+      layout_SFB, N, wt_groups_per_row, sf_vec_size);
+
+  // Sync so the buffer is ready before caching (other streams may use it).
+  cudaStreamSynchronize(stream);
+
+  {
+    std::lock_guard<std::mutex> lock(sfb_cache_mutex);
+    auto it = sfb_cache.find(key);
+    if (it != sfb_cache.end()) {
+      cudaFree(sfb_ptr); // Another thread won the race.
+      return it->second.device_ptr;
+    }
+    sfb_cache[key] = {sfb_ptr, sfb_bytes};
+  }
+
+  return sfb_ptr;
 }
 
 // ============================================================================
@@ -245,9 +353,10 @@ __device__ __forceinline__ uint8_t quantize_float_to_e2m1(float v) {
   return bits;
 }
 
-// FP4 activation quantization — FP16 input, warp-cooperative.
+// FP4 activation quantization — FP16 input, vectorized.
+// Each thread processes ELEMS_PER_THREAD=4 consecutive elements via uint2 load.
 // SF_VEC_SIZE: 16 (NVFP4) or 32 (MXFP4). Templated for compile-time optimization.
-template <int SF_VEC_SIZE, typename SFType, typename LayoutSF>
+template <int SF_VEC_SIZE, int ELEMS_PER_THREAD, typename SFType, typename LayoutSF>
 __global__ void quantize_activation_fp4_kernel(
     const __half* __restrict__ input,
     uint8_t* __restrict__ output,
@@ -255,37 +364,46 @@ __global__ void quantize_activation_fp4_kernel(
     LayoutSF layout_sfa,
     int M,
     int K) {
-  constexpr int GROUPS_PER_WARP = 32 / SF_VEC_SIZE;
+  static_assert(ELEMS_PER_THREAD == 4, "Only ELEMS_PER_THREAD=4 supported");
+  constexpr int THREADS_PER_GROUP = SF_VEC_SIZE / ELEMS_PER_THREAD;
+  constexpr int GROUPS_PER_WARP = 32 / THREADS_PER_GROUP;
+
   int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
   int warp_id = global_tid / 32;
   int lane = global_tid % 32;
-  int sub_group = lane / SF_VEC_SIZE;
-  int local_lane = lane % SF_VEC_SIZE;
+  int sub_group = lane / THREADS_PER_GROUP;
+  int local_lane = lane % THREADS_PER_GROUP;
 
   int num_groups = K / SF_VEC_SIZE;
   int total_groups = M * num_groups;
   int group_idx = warp_id * GROUPS_PER_WARP + sub_group;
 
-  // For SF_VEC_SIZE=16, last warp's second sub-group may be OOB.
-  // Use safe index for loads (read harmless data), guard writes with 'valid'.
   bool valid = (group_idx < total_groups);
   int safe_idx = valid ? group_idx : (total_groups - 1);
   int m = safe_idx / num_groups;
   int g = safe_idx % num_groups;
 
-  // Coalesced load: warp reads 32 consecutive half values = 64 bytes.
-  __half val = input[m * K + g * SF_VEC_SIZE + local_lane];
-  float abs_val = fabsf(__half2float(val));
+  // Vectorized load: 4 consecutive halves (8 bytes) via uint2.
+  int base_addr = m * K + g * SF_VEC_SIZE + local_lane * ELEMS_PER_THREAD;
+  uint2 loaded = *reinterpret_cast<const uint2*>(&input[base_addr]);
+  __half2 h01 = *reinterpret_cast<__half2*>(&loaded.x);
+  __half2 h23 = *reinterpret_cast<__half2*>(&loaded.y);
+  float v0 = __half2float(__low2half(h01));
+  float v1 = __half2float(__high2half(h01));
+  float v2 = __half2float(__low2half(h23));
+  float v3 = __half2float(__high2half(h23));
 
-  // Warp shuffle amax reduction within sub-group.
-  unsigned sub_mask = (SF_VEC_SIZE == 32) ? 0xffffffffu
-      : (((1u << SF_VEC_SIZE) - 1) << (sub_group * SF_VEC_SIZE));
+  // Local amax across 4 values, then shuffle across THREADS_PER_GROUP.
+  float local_amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)),
+                           fmaxf(fabsf(v2), fabsf(v3)));
+  unsigned sub_mask = (THREADS_PER_GROUP == 32) ? 0xffffffffu
+      : (((1u << THREADS_PER_GROUP) - 1) << (sub_group * THREADS_PER_GROUP));
   #pragma unroll
-  for (int offset = SF_VEC_SIZE / 2; offset > 0; offset >>= 1) {
-    abs_val = fmaxf(abs_val, __shfl_xor_sync(sub_mask, abs_val, offset));
+  for (int offset = THREADS_PER_GROUP / 2; offset > 0; offset >>= 1) {
+    local_amax = fmaxf(local_amax, __shfl_xor_sync(sub_mask, local_amax, offset));
   }
 
-  float scale = (abs_val > 0.0f) ? (abs_val / 6.0f) : 1.0f;
+  float scale = (local_amax > 0.0f) ? (local_amax / 6.0f) : 1.0f;
   float inv_scale = 1.0f / scale;
 
   if (valid && local_lane == 0) {
@@ -293,19 +411,22 @@ __global__ void quantize_activation_fp4_kernel(
     sf_out[sf_offset] = static_cast<SFType>(scale);
   }
 
-  // Quantize to e2m1 and pack pairs via warp shuffle.
-  float v = __half2float(val) * inv_scale;
-  uint8_t q = quantize_float_to_e2m1(v);
-  uint8_t partner_q = static_cast<uint8_t>(
-      __shfl_xor_sync(sub_mask, static_cast<unsigned>(q), 1));
-  if (valid && (local_lane & 1) == 0) {
-    int pack_addr = m * (K / 2) + g * (SF_VEC_SIZE / 2) + local_lane / 2;
-    output[pack_addr] = q | (partner_q << 4);
+  // Quantize 4 values to 4 nibbles, pack into 2 bytes.
+  uint8_t q0 = quantize_float_to_e2m1(v0 * inv_scale);
+  uint8_t q1 = quantize_float_to_e2m1(v1 * inv_scale);
+  uint8_t q2 = quantize_float_to_e2m1(v2 * inv_scale);
+  uint8_t q3 = quantize_float_to_e2m1(v3 * inv_scale);
+
+  // Every thread writes 2 packed bytes (100% lane utilization).
+  if (valid) {
+    int out_base = m * (K / 2) + g * (SF_VEC_SIZE / 2) + local_lane * (ELEMS_PER_THREAD / 2);
+    output[out_base]     = q0 | (q1 << 4);
+    output[out_base + 1] = q2 | (q3 << 4);
   }
 }
 
-// FP4 activation quantization — BF16 input, warp-cooperative.
-template <int SF_VEC_SIZE, typename SFType, typename LayoutSF>
+// FP4 activation quantization — BF16 input, vectorized.
+template <int SF_VEC_SIZE, int ELEMS_PER_THREAD, typename SFType, typename LayoutSF>
 __global__ void quantize_activation_fp4_bf16_kernel(
     const __nv_bfloat16* __restrict__ input,
     uint8_t* __restrict__ output,
@@ -313,12 +434,15 @@ __global__ void quantize_activation_fp4_bf16_kernel(
     LayoutSF layout_sfa,
     int M,
     int K) {
-  constexpr int GROUPS_PER_WARP = 32 / SF_VEC_SIZE;
+  static_assert(ELEMS_PER_THREAD == 4, "Only ELEMS_PER_THREAD=4 supported");
+  constexpr int THREADS_PER_GROUP = SF_VEC_SIZE / ELEMS_PER_THREAD;
+  constexpr int GROUPS_PER_WARP = 32 / THREADS_PER_GROUP;
+
   int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
   int warp_id = global_tid / 32;
   int lane = global_tid % 32;
-  int sub_group = lane / SF_VEC_SIZE;
-  int local_lane = lane % SF_VEC_SIZE;
+  int sub_group = lane / THREADS_PER_GROUP;
+  int local_lane = lane % THREADS_PER_GROUP;
 
   int num_groups = K / SF_VEC_SIZE;
   int total_groups = M * num_groups;
@@ -329,17 +453,27 @@ __global__ void quantize_activation_fp4_bf16_kernel(
   int m = safe_idx / num_groups;
   int g = safe_idx % num_groups;
 
-  __nv_bfloat16 val = input[m * K + g * SF_VEC_SIZE + local_lane];
-  float abs_val = fabsf(__bfloat162float(val));
+  // Vectorized load: 4 consecutive bf16 values (8 bytes) via uint2.
+  int base_addr = m * K + g * SF_VEC_SIZE + local_lane * ELEMS_PER_THREAD;
+  uint2 loaded = *reinterpret_cast<const uint2*>(&input[base_addr]);
+  __nv_bfloat162 b01 = *reinterpret_cast<__nv_bfloat162*>(&loaded.x);
+  __nv_bfloat162 b23 = *reinterpret_cast<__nv_bfloat162*>(&loaded.y);
+  float v0 = __bfloat162float(__low2bfloat16(b01));
+  float v1 = __bfloat162float(__high2bfloat16(b01));
+  float v2 = __bfloat162float(__low2bfloat16(b23));
+  float v3 = __bfloat162float(__high2bfloat16(b23));
 
-  unsigned sub_mask = (SF_VEC_SIZE == 32) ? 0xffffffffu
-      : (((1u << SF_VEC_SIZE) - 1) << (sub_group * SF_VEC_SIZE));
+  // Local amax across 4 values, then shuffle across THREADS_PER_GROUP.
+  float local_amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)),
+                           fmaxf(fabsf(v2), fabsf(v3)));
+  unsigned sub_mask = (THREADS_PER_GROUP == 32) ? 0xffffffffu
+      : (((1u << THREADS_PER_GROUP) - 1) << (sub_group * THREADS_PER_GROUP));
   #pragma unroll
-  for (int offset = SF_VEC_SIZE / 2; offset > 0; offset >>= 1) {
-    abs_val = fmaxf(abs_val, __shfl_xor_sync(sub_mask, abs_val, offset));
+  for (int offset = THREADS_PER_GROUP / 2; offset > 0; offset >>= 1) {
+    local_amax = fmaxf(local_amax, __shfl_xor_sync(sub_mask, local_amax, offset));
   }
 
-  float scale = (abs_val > 0.0f) ? (abs_val / 6.0f) : 1.0f;
+  float scale = (local_amax > 0.0f) ? (local_amax / 6.0f) : 1.0f;
   float inv_scale = 1.0f / scale;
 
   if (valid && local_lane == 0) {
@@ -347,28 +481,30 @@ __global__ void quantize_activation_fp4_bf16_kernel(
     sf_out[sf_offset] = static_cast<SFType>(scale);
   }
 
-  float v = __bfloat162float(val) * inv_scale;
-  uint8_t q = quantize_float_to_e2m1(v);
-  uint8_t partner_q = static_cast<uint8_t>(
-      __shfl_xor_sync(sub_mask, static_cast<unsigned>(q), 1));
-  if (valid && (local_lane & 1) == 0) {
-    int pack_addr = m * (K / 2) + g * (SF_VEC_SIZE / 2) + local_lane / 2;
-    output[pack_addr] = q | (partner_q << 4);
+  uint8_t q0 = quantize_float_to_e2m1(v0 * inv_scale);
+  uint8_t q1 = quantize_float_to_e2m1(v1 * inv_scale);
+  uint8_t q2 = quantize_float_to_e2m1(v2 * inv_scale);
+  uint8_t q3 = quantize_float_to_e2m1(v3 * inv_scale);
+
+  if (valid) {
+    int out_base = m * (K / 2) + g * (SF_VEC_SIZE / 2) + local_lane * (ELEMS_PER_THREAD / 2);
+    output[out_base]     = q0 | (q1 << 4);
+    output[out_base + 1] = q2 | (q3 << 4);
   }
 }
 
 // ============================================================================
-// FP8 (e4m3) activation quantization — warp-cooperative.
+// FP8 (e4m3) activation quantization — vectorized.
 //
-// Each warp processes one group of 32 elements (sf_vec_size is always 32 for
-// MXFP8). Each thread loads 1 element, reduces amax via shuffle, quantizes,
-// and writes 1 byte (no nibble packing like FP4).
+// Each thread processes ELEMS_PER_THREAD=4 elements via uint2 load.
+// sf_vec_size is always 32 for MXFP8 -> THREADS_PER_GROUP = 32/4 = 8,
+// GROUPS_PER_WARP = 32/8 = 4.
 //
 // e4m3 representable range: +/-[2^-9, 448]. Max magnitude = 448.0.
 // ============================================================================
 
-// FP8 activation quantization — FP16 input, warp-cooperative.
-template <typename SFType, typename LayoutSF>
+// FP8 activation quantization — FP16 input, vectorized.
+template <int ELEMS_PER_THREAD, typename SFType, typename LayoutSF>
 __global__ void quantize_activation_fp8_kernel(
     const __half* __restrict__ input,
     uint8_t* __restrict__ output,
@@ -376,46 +512,70 @@ __global__ void quantize_activation_fp8_kernel(
     LayoutSF layout_sfa,
     int M,
     int K) {
-  // sf_vec_size is always 32 for MXFP8 -> 1 group per warp.
+  static_assert(ELEMS_PER_THREAD == 4, "Only ELEMS_PER_THREAD=4 supported");
   constexpr int SF_VEC_SIZE = 32;
+  constexpr int THREADS_PER_GROUP = SF_VEC_SIZE / ELEMS_PER_THREAD;  // 8
+  constexpr int GROUPS_PER_WARP = 32 / THREADS_PER_GROUP;            // 4
+
   int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
   int warp_id = global_tid / 32;
   int lane = global_tid % 32;
+  int sub_group = lane / THREADS_PER_GROUP;
+  int local_lane = lane % THREADS_PER_GROUP;
 
   int num_groups = K / SF_VEC_SIZE;
   int total_groups = M * num_groups;
-  if (warp_id >= total_groups) return;
+  int group_idx = warp_id * GROUPS_PER_WARP + sub_group;
 
-  int m = warp_id / num_groups;
-  int g = warp_id % num_groups;
-  int addr = m * K + g * SF_VEC_SIZE + lane;
+  bool valid = (group_idx < total_groups);
+  int safe_idx = valid ? group_idx : (total_groups - 1);
+  int m = safe_idx / num_groups;
+  int g = safe_idx % num_groups;
 
-  // Coalesced load: 32 threads read 32 consecutive half values = 64 bytes.
-  __half val = input[addr];
-  float abs_val = fabsf(__half2float(val));
+  // Vectorized load: 4 consecutive halves (8 bytes) via uint2.
+  int base_addr = m * K + g * SF_VEC_SIZE + local_lane * ELEMS_PER_THREAD;
+  uint2 loaded = *reinterpret_cast<const uint2*>(&input[base_addr]);
+  __half2 h01 = *reinterpret_cast<__half2*>(&loaded.x);
+  __half2 h23 = *reinterpret_cast<__half2*>(&loaded.y);
+  float v0 = __half2float(__low2half(h01));
+  float v1 = __half2float(__high2half(h01));
+  float v2 = __half2float(__low2half(h23));
+  float v3 = __half2float(__high2half(h23));
 
-  // Warp-level amax reduction (full warp, all 32 threads).
+  // Local amax across 4 values, then shuffle across THREADS_PER_GROUP=8.
+  float local_amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)),
+                           fmaxf(fabsf(v2), fabsf(v3)));
+  unsigned sub_mask = (((1u << THREADS_PER_GROUP) - 1) << (sub_group * THREADS_PER_GROUP));
   #pragma unroll
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    abs_val = fmaxf(abs_val, __shfl_xor_sync(0xffffffff, abs_val, offset));
+  for (int offset = THREADS_PER_GROUP / 2; offset > 0; offset >>= 1) {
+    local_amax = fmaxf(local_amax, __shfl_xor_sync(sub_mask, local_amax, offset));
   }
 
-  float scale = (abs_val > 0.0f) ? (abs_val / 448.0f) : 1.0f;
+  float scale = (local_amax > 0.0f) ? (local_amax / 448.0f) : 1.0f;
   float inv_scale = 1.0f / scale;
 
-  if (lane == 0) {
+  if (valid && local_lane == 0) {
     auto sf_offset = layout_sfa(m, g * SF_VEC_SIZE, 0);
     sf_out[sf_offset] = static_cast<SFType>(scale);
   }
 
-  // Quantize and store — coalesced 32-byte write.
-  float v = __half2float(val) * inv_scale;
-  __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(v);
-  output[addr] = *reinterpret_cast<uint8_t*>(&fp8);
+  // Quantize 4 values and write 4 bytes via uint32_t store.
+  if (valid) {
+    __nv_fp8_e4m3 fp8_0 = __nv_fp8_e4m3(v0 * inv_scale);
+    __nv_fp8_e4m3 fp8_1 = __nv_fp8_e4m3(v1 * inv_scale);
+    __nv_fp8_e4m3 fp8_2 = __nv_fp8_e4m3(v2 * inv_scale);
+    __nv_fp8_e4m3 fp8_3 = __nv_fp8_e4m3(v3 * inv_scale);
+    uint32_t packed = static_cast<uint32_t>(*reinterpret_cast<uint8_t*>(&fp8_0))
+                    | (static_cast<uint32_t>(*reinterpret_cast<uint8_t*>(&fp8_1)) << 8)
+                    | (static_cast<uint32_t>(*reinterpret_cast<uint8_t*>(&fp8_2)) << 16)
+                    | (static_cast<uint32_t>(*reinterpret_cast<uint8_t*>(&fp8_3)) << 24);
+    int out_addr = m * K + g * SF_VEC_SIZE + local_lane * ELEMS_PER_THREAD;
+    *reinterpret_cast<uint32_t*>(&output[out_addr]) = packed;
+  }
 }
 
-// FP8 activation quantization — BF16 input, warp-cooperative.
-template <typename SFType, typename LayoutSF>
+// FP8 activation quantization — BF16 input, vectorized.
+template <int ELEMS_PER_THREAD, typename SFType, typename LayoutSF>
 __global__ void quantize_activation_fp8_bf16_kernel(
     const __nv_bfloat16* __restrict__ input,
     uint8_t* __restrict__ output,
@@ -423,38 +583,64 @@ __global__ void quantize_activation_fp8_bf16_kernel(
     LayoutSF layout_sfa,
     int M,
     int K) {
+  static_assert(ELEMS_PER_THREAD == 4, "Only ELEMS_PER_THREAD=4 supported");
   constexpr int SF_VEC_SIZE = 32;
+  constexpr int THREADS_PER_GROUP = SF_VEC_SIZE / ELEMS_PER_THREAD;  // 8
+  constexpr int GROUPS_PER_WARP = 32 / THREADS_PER_GROUP;            // 4
+
   int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
   int warp_id = global_tid / 32;
   int lane = global_tid % 32;
+  int sub_group = lane / THREADS_PER_GROUP;
+  int local_lane = lane % THREADS_PER_GROUP;
 
   int num_groups = K / SF_VEC_SIZE;
   int total_groups = M * num_groups;
-  if (warp_id >= total_groups) return;
+  int group_idx = warp_id * GROUPS_PER_WARP + sub_group;
 
-  int m = warp_id / num_groups;
-  int g = warp_id % num_groups;
-  int addr = m * K + g * SF_VEC_SIZE + lane;
+  bool valid = (group_idx < total_groups);
+  int safe_idx = valid ? group_idx : (total_groups - 1);
+  int m = safe_idx / num_groups;
+  int g = safe_idx % num_groups;
 
-  __nv_bfloat16 val = input[addr];
-  float abs_val = fabsf(__bfloat162float(val));
+  // Vectorized load: 4 consecutive bf16 values (8 bytes) via uint2.
+  int base_addr = m * K + g * SF_VEC_SIZE + local_lane * ELEMS_PER_THREAD;
+  uint2 loaded = *reinterpret_cast<const uint2*>(&input[base_addr]);
+  __nv_bfloat162 b01 = *reinterpret_cast<__nv_bfloat162*>(&loaded.x);
+  __nv_bfloat162 b23 = *reinterpret_cast<__nv_bfloat162*>(&loaded.y);
+  float v0 = __bfloat162float(__low2bfloat16(b01));
+  float v1 = __bfloat162float(__high2bfloat16(b01));
+  float v2 = __bfloat162float(__low2bfloat16(b23));
+  float v3 = __bfloat162float(__high2bfloat16(b23));
 
+  float local_amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)),
+                           fmaxf(fabsf(v2), fabsf(v3)));
+  unsigned sub_mask = (((1u << THREADS_PER_GROUP) - 1) << (sub_group * THREADS_PER_GROUP));
   #pragma unroll
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    abs_val = fmaxf(abs_val, __shfl_xor_sync(0xffffffff, abs_val, offset));
+  for (int offset = THREADS_PER_GROUP / 2; offset > 0; offset >>= 1) {
+    local_amax = fmaxf(local_amax, __shfl_xor_sync(sub_mask, local_amax, offset));
   }
 
-  float scale = (abs_val > 0.0f) ? (abs_val / 448.0f) : 1.0f;
+  float scale = (local_amax > 0.0f) ? (local_amax / 448.0f) : 1.0f;
   float inv_scale = 1.0f / scale;
 
-  if (lane == 0) {
+  if (valid && local_lane == 0) {
     auto sf_offset = layout_sfa(m, g * SF_VEC_SIZE, 0);
     sf_out[sf_offset] = static_cast<SFType>(scale);
   }
 
-  float v = __bfloat162float(val) * inv_scale;
-  __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(v);
-  output[addr] = *reinterpret_cast<uint8_t*>(&fp8);
+  if (valid) {
+    __nv_fp8_e4m3 fp8_0 = __nv_fp8_e4m3(v0 * inv_scale);
+    __nv_fp8_e4m3 fp8_1 = __nv_fp8_e4m3(v1 * inv_scale);
+    __nv_fp8_e4m3 fp8_2 = __nv_fp8_e4m3(v2 * inv_scale);
+    __nv_fp8_e4m3 fp8_3 = __nv_fp8_e4m3(v3 * inv_scale);
+    uint32_t packed = static_cast<uint32_t>(*reinterpret_cast<uint8_t*>(&fp8_0))
+                    | (static_cast<uint32_t>(*reinterpret_cast<uint8_t*>(&fp8_1)) << 8)
+                    | (static_cast<uint32_t>(*reinterpret_cast<uint8_t*>(&fp8_2)) << 16)
+                    | (static_cast<uint32_t>(*reinterpret_cast<uint8_t*>(&fp8_3)) << 24);
+    int out_addr = m * K + g * SF_VEC_SIZE + local_lane * ELEMS_PER_THREAD;
+    *reinterpret_cast<uint32_t*>(&output[out_addr]) = packed;
+  }
 }
 
 } // anonymous namespace (helper __global__ kernels)
@@ -645,7 +831,6 @@ void execute_sm120_fp4_gemm(
     cu::CommandEncoder& encoder) {
   using BlkConfig = typename GemmType::Sm1xxBlkScaledConfig;
   using LayoutSFA = typename GemmType::LayoutSFA;
-  using LayoutSFB = typename GemmType::LayoutSFB;
   using ElementA = typename GemmType::ElementA;
   using SFType = typename ElementA::ScaleFactorType;
 
@@ -654,14 +839,10 @@ void execute_sm120_fp4_gemm(
   int K = x.shape(-1);
   int sf_vec_size = BlkConfig::SFVecSize;
   int num_act_groups = M * (K / sf_vec_size);
-  int num_wt_groups = N * (K / sf_vec_size);
 
   auto problem_shape = cute::make_shape(M, N, K, 1);
   LayoutSFA layout_SFA = BlkConfig::tile_atom_to_shape_SFA(problem_shape);
-  LayoutSFB layout_SFB = BlkConfig::tile_atom_to_shape_SFB(problem_shape);
-
   int sfa_size = cute::cosize(layout_SFA);
-  int sfb_size = cute::cosize(layout_SFB);
 
   // Allocate temporary buffers.
   // 1. Quantized activation data: (M, K/2) packed FP4.
@@ -676,12 +857,6 @@ void execute_sm120_fp4_gemm(
   array sfa_buf(sfa_alloc, {sfa_size}, uint8);
   encoder.add_temporary(sfa_buf);
 
-  // 3. Reformatted weight scale factors in CUTLASS layout.
-  size_t sfb_bytes = static_cast<size_t>(sfb_size) * sizeof(SFType);
-  auto sfb_alloc = cu::malloc_async(sfb_bytes, encoder);
-  array sfb_buf(sfb_alloc, {static_cast<int>(sfb_bytes)}, uint8);
-  encoder.add_temporary(sfb_buf);
-
   // NOTE: No weight transpose needed! CUTLASS ColumnMajor B with
   // TagToStrideB<ColumnMajor> = Stride<int64_t, _1, int64_t> gives
   // stride_B = (K, 1, 0), meaning B(n,k) = ptr[n*K + k] — K contiguous.
@@ -690,22 +865,24 @@ void execute_sm120_fp4_gemm(
   auto& stream = encoder.stream();
   constexpr int kThreads = 256;
 
-  // Step 1: Quantize activations to FP4 (warp-cooperative).
-  // Grid is based on warps: each warp handles 32/sf_vec_size groups.
+  // Step 1: Quantize activations to FP4 (vectorized, 4 elements/thread).
+  // Each warp handles more groups than before due to vectorization.
   {
-    constexpr int GROUPS_PER_WARP = 32 / BlkConfig::SFVecSize;
+    constexpr int ELEMS_PER_THREAD = 4;
+    constexpr int THREADS_PER_GROUP = BlkConfig::SFVecSize / ELEMS_PER_THREAD;
+    constexpr int GROUPS_PER_WARP = 32 / THREADS_PER_GROUP;
     int total_warps = (num_act_groups + GROUPS_PER_WARP - 1) / GROUPS_PER_WARP;
     int total_threads = total_warps * 32;
     int blocks = (total_threads + kThreads - 1) / kThreads;
     if constexpr (std::is_same_v<InputType, __nv_bfloat16>) {
-      quantize_activation_fp4_bf16_kernel<BlkConfig::SFVecSize>
+      quantize_activation_fp4_bf16_kernel<BlkConfig::SFVecSize, ELEMS_PER_THREAD>
           <<<blocks, kThreads, 0, stream>>>(
           reinterpret_cast<const __nv_bfloat16*>(x.data<void>()),
           reinterpret_cast<uint8_t*>(x_q_buf.data<void>()),
           reinterpret_cast<SFType*>(sfa_buf.data<void>()),
           layout_SFA, M, K);
     } else {
-      quantize_activation_fp4_kernel<BlkConfig::SFVecSize>
+      quantize_activation_fp4_kernel<BlkConfig::SFVecSize, ELEMS_PER_THREAD>
           <<<blocks, kThreads, 0, stream>>>(
           reinterpret_cast<const __half*>(x.data<void>()),
           reinterpret_cast<uint8_t*>(x_q_buf.data<void>()),
@@ -714,15 +891,10 @@ void execute_sm120_fp4_gemm(
     }
   }
 
-  // Step 2: Reformat weight scale factors from row-major to CUTLASS layout.
-  {
-    int wt_groups_per_row = K / group_size;
-    int blocks = (num_wt_groups + kThreads - 1) / kThreads;
-    reformat_sf_kernel<<<blocks, kThreads, 0, stream>>>(
-        reinterpret_cast<const SFType*>(scales.data<void>()),
-        reinterpret_cast<SFType*>(sfb_buf.data<void>()),
-        layout_SFB, N, wt_groups_per_row, sf_vec_size);
-  }
+  // Step 2: Get cached reformatted weight scale factors.
+  // layout_SFB depends only on (N, K, BlkConfig), not M — safe to cache.
+  void* sfb_ptr = get_or_reformat_sfb<GemmType>(
+      scales.data<void>(), N, K, group_size, stream);
 
   // Step 3: Run CUTLASS block-scaled GEMM.
   // Weight data (w) is passed directly — no transpose needed.
@@ -734,7 +906,7 @@ void execute_sm120_fp4_gemm(
       x_q_buf.data<void>(),
       sfa_buf.data<void>(),
       w.data<void>(),
-      sfb_buf.data<void>(),
+      sfb_ptr,
       out.data<void>(),
       encoder);
 }
@@ -757,7 +929,6 @@ void execute_sm120_fp8_gemm(
     cu::CommandEncoder& encoder) {
   using BlkConfig = typename GemmType::Sm1xxBlkScaledConfig;
   using LayoutSFA = typename GemmType::LayoutSFA;
-  using LayoutSFB = typename GemmType::LayoutSFB;
   using ElementA = typename GemmType::ElementA;
   using SFType = typename ElementA::ScaleFactorType;
 
@@ -766,14 +937,10 @@ void execute_sm120_fp8_gemm(
   int K = x.shape(-1);
   int sf_vec_size = BlkConfig::SFVecSize;
   int num_act_groups = M * (K / sf_vec_size);
-  int num_wt_groups = N * (K / sf_vec_size);
 
   auto problem_shape = cute::make_shape(M, N, K, 1);
   LayoutSFA layout_SFA = BlkConfig::tile_atom_to_shape_SFA(problem_shape);
-  LayoutSFB layout_SFB = BlkConfig::tile_atom_to_shape_SFB(problem_shape);
-
   int sfa_size = cute::cosize(layout_SFA);
-  int sfb_size = cute::cosize(layout_SFB);
 
   // 1. Quantized activation data: (M, K) FP8 — 1 byte per element (NOT M*K/2).
   size_t x_q_bytes = static_cast<size_t>(M) * K;
@@ -787,29 +954,29 @@ void execute_sm120_fp8_gemm(
   array sfa_buf(sfa_alloc, {sfa_size}, uint8);
   encoder.add_temporary(sfa_buf);
 
-  // 3. Reformatted weight scale factors in CUTLASS layout.
-  size_t sfb_bytes = static_cast<size_t>(sfb_size) * sizeof(SFType);
-  auto sfb_alloc = cu::malloc_async(sfb_bytes, encoder);
-  array sfb_buf(sfb_alloc, {static_cast<int>(sfb_bytes)}, uint8);
-  encoder.add_temporary(sfb_buf);
-
   auto& stream = encoder.stream();
   constexpr int kThreads = 256;
 
-  // Step 1: Quantize activations to FP8 (warp-cooperative, sf_vec_size=32).
-  // Each warp processes one group of 32 elements.
+  // Step 1: Quantize activations to FP8 (vectorized, 4 elements/thread).
+  // sf_vec_size=32, THREADS_PER_GROUP=8, GROUPS_PER_WARP=4.
   {
-    int total_warps = num_act_groups; // 1 group per warp
+    constexpr int ELEMS_PER_THREAD = 4;
+    constexpr int SF_VEC_SIZE_FP8 = 32;
+    constexpr int THREADS_PER_GROUP = SF_VEC_SIZE_FP8 / ELEMS_PER_THREAD;  // 8
+    constexpr int GROUPS_PER_WARP = 32 / THREADS_PER_GROUP;                // 4
+    int total_warps = (num_act_groups + GROUPS_PER_WARP - 1) / GROUPS_PER_WARP;
     int total_threads = total_warps * 32;
     int blocks = (total_threads + kThreads - 1) / kThreads;
     if constexpr (std::is_same_v<InputType, __nv_bfloat16>) {
-      quantize_activation_fp8_bf16_kernel<<<blocks, kThreads, 0, stream>>>(
+      quantize_activation_fp8_bf16_kernel<ELEMS_PER_THREAD>
+          <<<blocks, kThreads, 0, stream>>>(
           reinterpret_cast<const __nv_bfloat16*>(x.data<void>()),
           reinterpret_cast<uint8_t*>(x_q_buf.data<void>()),
           reinterpret_cast<SFType*>(sfa_buf.data<void>()),
           layout_SFA, M, K);
     } else {
-      quantize_activation_fp8_kernel<<<blocks, kThreads, 0, stream>>>(
+      quantize_activation_fp8_kernel<ELEMS_PER_THREAD>
+          <<<blocks, kThreads, 0, stream>>>(
           reinterpret_cast<const __half*>(x.data<void>()),
           reinterpret_cast<uint8_t*>(x_q_buf.data<void>()),
           reinterpret_cast<SFType*>(sfa_buf.data<void>()),
@@ -817,15 +984,9 @@ void execute_sm120_fp8_gemm(
     }
   }
 
-  // Step 2: Reformat weight scale factors from row-major to CUTLASS layout.
-  {
-    int wt_groups_per_row = K / group_size;
-    int blocks = (num_wt_groups + kThreads - 1) / kThreads;
-    reformat_sf_kernel<<<blocks, kThreads, 0, stream>>>(
-        reinterpret_cast<const SFType*>(scales.data<void>()),
-        reinterpret_cast<SFType*>(sfb_buf.data<void>()),
-        layout_SFB, N, wt_groups_per_row, sf_vec_size);
-  }
+  // Step 2: Get cached reformatted weight scale factors.
+  void* sfb_ptr = get_or_reformat_sfb<GemmType>(
+      scales.data<void>(), N, K, group_size, stream);
 
   // Step 3: Run CUTLASS block-scaled GEMM.
   // FP8 weight data stored as (N, K) row-major — K contiguous, same as FP4.
@@ -835,7 +996,7 @@ void execute_sm120_fp8_gemm(
       x_q_buf.data<void>(),
       sfa_buf.data<void>(),
       w.data<void>(),
-      sfb_buf.data<void>(),
+      sfb_ptr,
       out.data<void>(),
       encoder);
 }
@@ -925,6 +1086,13 @@ using MxFP4_FP16_Gemm_PP = Sm120BlockScaledGemm<
     cutlass::mx_float4_t<cutlass::float_e2m1_t>,
     cutlass::half_t, 32, 32, Sm120FP4TileShape,
     cutlass::gemm::KernelTmaWarpSpecializedPingpongMxf4Sm120>;
+
+// NOTE: Tile shape sweep results (2025-03):
+// - 64×128×128: FAILS — CUTLASS TMA scale factor layout requires BM >= 128
+// - 128×64×128: FAILS — CUTLASS TMA scale factor layout requires BN >= 128
+// Minimum tile for SM120 block-scaled GEMM is 128×128×K (all scale factor types).
+// The only remaining avenue for improving wave utilization at small M is SplitK
+// or Stream-K tile schedulers.
 
 // Non-template helper: configure kernel and return void* pointer.
 // Each variant is a separate non-template function to ensure consistent
@@ -1124,6 +1292,11 @@ static void* get_configured_kernel_mxfp4_fp16_pp() {
 
 // Helper: dispatch to the correct execute_sm120_fp4_gemm variant based on
 // group_size and output dtype.
+//
+// NOTE: StreamK scheduler was tested (2025-03) and provides <6% GEMM-level
+// improvement on DGX Spark (LPDDR5x bandwidth-limited). Additionally, StreamK
+// workspace allocation breaks CUDA graph replay (NaN output). Not worth the
+// complexity; Pingpong schedule is used for all M values.
 static void dispatch_sm120_fp4(
     const array& x,
     const array& w,
@@ -1257,6 +1430,7 @@ void cute_qmm_fp4_sm120(
 // ============================================================================
 
 // Helper: dispatch to the correct execute_sm120_fp8_gemm variant.
+// No small-tile variant for FP8 — CUTLASS TMA scale factor layout requires BM >= 128.
 static void dispatch_sm120_fp8(
     const array& x,
     const array& w,
@@ -1341,6 +1515,14 @@ void cute_qmm_fp8_sm120(
   dispatch_sm120_fp8(x, w, scales, out, group_size, encoder);
 }
 
+void clear_sm120_sf_cache() {
+  std::lock_guard<std::mutex> lock(sfb_cache_mutex);
+  for (auto& [key, entry] : sfb_cache) {
+    cudaFree(entry.device_ptr);
+  }
+  sfb_cache.clear();
+}
+
 } // namespace mlx::core
 
 #else // No SM120 support
@@ -1370,6 +1552,10 @@ void cute_qmm_fp8_sm120(
   throw std::runtime_error(
       "[qmm_fp8_sm120] SM120 block-scaled GEMM requires CUDA 13.0+ "
       "compiled with SM120/SM121 target.");
+}
+
+void clear_sm120_sf_cache() {
+  // No-op: SM120 not supported on this build.
 }
 
 } // namespace mlx::core

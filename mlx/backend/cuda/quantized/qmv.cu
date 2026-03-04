@@ -199,8 +199,13 @@ __global__ void fp_qmv_batched(
 }
 
 // Persistent QMV kernel: each block processes a contiguous range of rows.
-// Uses shared memory for the activation vector to eliminate L2 contention
-// and ensure sequential DRAM access (one block per SM).
+// Uses shared memory for the activation vector to offload reads from L1TEX,
+// which handles weight loads. This separation is critical for FP4 where
+// activation is 80% of total L1TEX traffic without smem (64B act + 16B wt).
+// The smem has 16-way bank conflicts (64-byte thread stride maps to 2/32 banks)
+// but these are hidden by ~100-200ns DRAM latency on the weight load path.
+// Removing smem was tested: MXFP8 unchanged, FP4 regressed 13% due to L1TEX
+// port congestion. Keep smem.
 // Grid: {M, num_sms}. Each block handles ceil(N / num_sms) rows.
 template <
     typename T,
