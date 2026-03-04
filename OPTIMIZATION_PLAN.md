@@ -644,15 +644,29 @@ when unloading models to free GPU memory.
    decode/prefill comparison would validate the effort and identify whether attention/KV-cache/
    sampling are now the bottleneck.
 
-6. **QMV ILP/latency hiding** (MEDIUM) — Remaining vectors: n=8 template, double-buffer in
+6. ~~**FP16 accumulation for QMV**~~ — **FAILED (2026-03)**. Attempted zcbenz-style `__half2`
+   packed FMA accumulation for FP4 QMV inner loop (inspired by ml-explore/mlx#3197). Custom
+   `__half` LUT for FP4 E2M1 dequant + `__hfma2` instead of FFMA. A/B benchmark showed
+   **no improvement** — NVFP4 4096² min: 43→54µs (+26%), MXFP8 control: 38→48µs (+24% noise).
+   **Root cause**: Kernel is memory-bound (89-98% L1TEX scoreboard), not ALU-bound. The hardware
+   `__nv_fp4x4_e2m1::operator float4()` uses optimized single-instruction conversion; our LUT
+   (4 bit-extracts + 4 constant cache loads + 2 packs) is SLOWER. Total instruction count is
+   similar or worse — `__hfma2` savings eaten by format conversion overhead. zcbenz's technique
+   works on A100/H100 where INT4 affine dequant is software-based (LUT + bit manipulation);
+   SM121's native FP4 E2M1 hardware conversion makes this unnecessary.
+   **Key lesson**: Don't optimize ALU on a memory-bound kernel. The L2 BW gap (FP4 51% vs FP8
+   83%) is a fundamental consequence of FP4 needing 2x more dequant operations per byte loaded,
+   reducing outstanding memory operations in the pipeline.
+
+7. **QMV ILP/latency hiding** (MEDIUM) — Remaining vectors: n=8 template, double-buffer in
    registers, `__ldg()` prefetch. Ceiling is modest — persistent QMV already at 81% DRAM BW
    on large shapes. Would mainly help L2-cached shapes (7B/13B decode).
 
-7. **Tensor core GEMV** (LOW, HIGH-RISK) — Use `mma.sync.aligned.block_scale` for M=1.
+8. **Tensor core GEMV** (LOW, HIGH-RISK) — Use `mma.sync.aligned.block_scale` for M=1.
    Ceiling is only ~23 GB/s improvement (222 → 245 GB/s). Complex to implement, may not
    yield measurable improvement given framework overhead dominance at M=1.
 
-8. **L2 threshold tuning** — Profile persistent QMV under real inference workload to
+9. **L2 threshold tuning** — Profile persistent QMV under real inference workload to
    determine if 24MB threshold needs lowering to account for L2 contention.
 
 ---

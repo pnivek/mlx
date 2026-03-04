@@ -94,43 +94,78 @@ __device__ void fp_qmv_impl(
           unsafe_load_vector<n_per_thread>(mat + row * packed_cols + col, 0);
 #pragma unroll
       for (int i = 0; i < scales_per_step; ++i) {
-        float2 local_sum = {0.0f, 0.0f};
+        // FP16 accumulation for FP4 with half-precision inputs.
+        // Uses hardware cvt.rn.f16x2.e2m1x2 (F2FP SASS) + HFMA2 for
+        // 2.5x fewer instructions vs the FP32 path per uint32 of weights.
+        // Scale multiply stays in FP32 (once per group, not per element).
+        if constexpr (bits < 8 && std::is_same_v<T, __half>) {
+          __half2 h2_a = __float2half2_rn(0.0f);
+          __half2 h2_b = __float2half2_rn(0.0f);
 #pragma unroll
-        for (int j = 0; j < n_per_step; ++j) {
-          int k = n_per_step * i + j;
-          if constexpr (bits == 8) {
-            auto v = dequant_fp8(local_mat[k]);
-            local_sum.x +=
-                v.x * static_cast<float>(local_vec[vals_per_item * k]);
-            local_sum.x +=
-                v.y * static_cast<float>(local_vec[vals_per_item * k + 1]);
-            local_sum.y +=
-                v.z * static_cast<float>(local_vec[vals_per_item * k + 2]);
-            local_sum.y +=
-                v.w * static_cast<float>(local_vec[vals_per_item * k + 3]);
-          } else {
-            auto v = dequant_fp4(local_mat[k]);
-            local_sum.x +=
-                v.x * static_cast<float>(local_vec[vals_per_item * k]);
-            local_sum.y +=
-                v.y * static_cast<float>(local_vec[vals_per_item * k + 1]);
-            local_sum.x +=
-                v.z * static_cast<float>(local_vec[vals_per_item * k + 2]);
-            local_sum.y +=
-                v.w * static_cast<float>(local_vec[vals_per_item * k + 3]);
-
-            v = dequant_fp4(local_mat[k] >> 16);
-            local_sum.x +=
-                v.x * static_cast<float>(local_vec[vals_per_item * k + 4]);
-            local_sum.y +=
-                v.y * static_cast<float>(local_vec[vals_per_item * k + 5]);
-            local_sum.x +=
-                v.z * static_cast<float>(local_vec[vals_per_item * k + 6]);
-            local_sum.y +=
-                v.w * static_cast<float>(local_vec[vals_per_item * k + 7]);
+          for (int j = 0; j < n_per_step; ++j) {
+            int k = n_per_step * i + j;
+            __half2 w01, w23, w45, w67;
+            dequant_fp4_half2x4(local_mat[k], w01, w23, w45, w67);
+            __half2 a01 = __halves2half2(
+                local_vec[vals_per_item * k],
+                local_vec[vals_per_item * k + 1]);
+            __half2 a23 = __halves2half2(
+                local_vec[vals_per_item * k + 2],
+                local_vec[vals_per_item * k + 3]);
+            __half2 a45 = __halves2half2(
+                local_vec[vals_per_item * k + 4],
+                local_vec[vals_per_item * k + 5]);
+            __half2 a67 = __halves2half2(
+                local_vec[vals_per_item * k + 6],
+                local_vec[vals_per_item * k + 7]);
+            h2_a = __hfma2(w01, a01, h2_a);
+            h2_b = __hfma2(w23, a23, h2_b);
+            h2_a = __hfma2(w45, a45, h2_a);
+            h2_b = __hfma2(w67, a67, h2_b);
           }
+          __half2 group = __hadd2(h2_a, h2_b);
+          sum += (__half2float(__low2half(group)) +
+                  __half2float(__high2half(group))) *
+              float(scales[i]);
+        } else {
+          float2 local_sum = {0.0f, 0.0f};
+#pragma unroll
+          for (int j = 0; j < n_per_step; ++j) {
+            int k = n_per_step * i + j;
+            if constexpr (bits == 8) {
+              auto v = dequant_fp8(local_mat[k]);
+              local_sum.x +=
+                  v.x * static_cast<float>(local_vec[vals_per_item * k]);
+              local_sum.x +=
+                  v.y * static_cast<float>(local_vec[vals_per_item * k + 1]);
+              local_sum.y +=
+                  v.z * static_cast<float>(local_vec[vals_per_item * k + 2]);
+              local_sum.y +=
+                  v.w * static_cast<float>(local_vec[vals_per_item * k + 3]);
+            } else {
+              auto v = dequant_fp4(local_mat[k]);
+              local_sum.x +=
+                  v.x * static_cast<float>(local_vec[vals_per_item * k]);
+              local_sum.y +=
+                  v.y * static_cast<float>(local_vec[vals_per_item * k + 1]);
+              local_sum.x +=
+                  v.z * static_cast<float>(local_vec[vals_per_item * k + 2]);
+              local_sum.y +=
+                  v.w * static_cast<float>(local_vec[vals_per_item * k + 3]);
+
+              v = dequant_fp4(local_mat[k] >> 16);
+              local_sum.x +=
+                  v.x * static_cast<float>(local_vec[vals_per_item * k + 4]);
+              local_sum.y +=
+                  v.y * static_cast<float>(local_vec[vals_per_item * k + 5]);
+              local_sum.x +=
+                  v.z * static_cast<float>(local_vec[vals_per_item * k + 6]);
+              local_sum.y +=
+                  v.w * static_cast<float>(local_vec[vals_per_item * k + 7]);
+            }
+          }
+          sum += (local_sum.x + local_sum.y) * float(scales[i]);
         }
-        sum += (local_sum.x + local_sum.y) * float(scales[i]);
       }
       scales += scale_step;
     }
@@ -279,43 +314,74 @@ __global__ void fp_qmv_persistent(
             mat + row * packed_cols + col, 0);
 #pragma unroll
         for (int i = 0; i < scales_per_step; ++i) {
-          float2 local_sum = {0.0f, 0.0f};
+          if constexpr (bits < 8 && std::is_same_v<T, __half>) {
+            __half2 h2_a = __float2half2_rn(0.0f);
+            __half2 h2_b = __float2half2_rn(0.0f);
 #pragma unroll
-          for (int j = 0; j < n_per_step; ++j) {
-            int k = n_per_step * i + j;
-            if constexpr (bits == 8) {
-              auto v = dequant_fp8(local_mat[k]);
-              local_sum.x +=
-                  v.x * static_cast<float>(local_vec[vals_per_item * k]);
-              local_sum.x +=
-                  v.y * static_cast<float>(local_vec[vals_per_item * k + 1]);
-              local_sum.y +=
-                  v.z * static_cast<float>(local_vec[vals_per_item * k + 2]);
-              local_sum.y +=
-                  v.w * static_cast<float>(local_vec[vals_per_item * k + 3]);
-            } else {
-              auto v = dequant_fp4(local_mat[k]);
-              local_sum.x +=
-                  v.x * static_cast<float>(local_vec[vals_per_item * k]);
-              local_sum.y +=
-                  v.y * static_cast<float>(local_vec[vals_per_item * k + 1]);
-              local_sum.x +=
-                  v.z * static_cast<float>(local_vec[vals_per_item * k + 2]);
-              local_sum.y +=
-                  v.w * static_cast<float>(local_vec[vals_per_item * k + 3]);
-
-              v = dequant_fp4(local_mat[k] >> 16);
-              local_sum.x +=
-                  v.x * static_cast<float>(local_vec[vals_per_item * k + 4]);
-              local_sum.y +=
-                  v.y * static_cast<float>(local_vec[vals_per_item * k + 5]);
-              local_sum.x +=
-                  v.z * static_cast<float>(local_vec[vals_per_item * k + 6]);
-              local_sum.y +=
-                  v.w * static_cast<float>(local_vec[vals_per_item * k + 7]);
+            for (int j = 0; j < n_per_step; ++j) {
+              int k = n_per_step * i + j;
+              __half2 w01, w23, w45, w67;
+              dequant_fp4_half2x4(local_mat[k], w01, w23, w45, w67);
+              __half2 a01 = __halves2half2(
+                  local_vec[vals_per_item * k],
+                  local_vec[vals_per_item * k + 1]);
+              __half2 a23 = __halves2half2(
+                  local_vec[vals_per_item * k + 2],
+                  local_vec[vals_per_item * k + 3]);
+              __half2 a45 = __halves2half2(
+                  local_vec[vals_per_item * k + 4],
+                  local_vec[vals_per_item * k + 5]);
+              __half2 a67 = __halves2half2(
+                  local_vec[vals_per_item * k + 6],
+                  local_vec[vals_per_item * k + 7]);
+              h2_a = __hfma2(w01, a01, h2_a);
+              h2_b = __hfma2(w23, a23, h2_b);
+              h2_a = __hfma2(w45, a45, h2_a);
+              h2_b = __hfma2(w67, a67, h2_b);
             }
+            __half2 group = __hadd2(h2_a, h2_b);
+            sum += (__half2float(__low2half(group)) +
+                    __half2float(__high2half(group))) *
+                float(row_scales[i]);
+          } else {
+            float2 local_sum = {0.0f, 0.0f};
+#pragma unroll
+            for (int j = 0; j < n_per_step; ++j) {
+              int k = n_per_step * i + j;
+              if constexpr (bits == 8) {
+                auto v = dequant_fp8(local_mat[k]);
+                local_sum.x +=
+                    v.x * static_cast<float>(local_vec[vals_per_item * k]);
+                local_sum.x +=
+                    v.y * static_cast<float>(local_vec[vals_per_item * k + 1]);
+                local_sum.y +=
+                    v.z * static_cast<float>(local_vec[vals_per_item * k + 2]);
+                local_sum.y +=
+                    v.w * static_cast<float>(local_vec[vals_per_item * k + 3]);
+              } else {
+                auto v = dequant_fp4(local_mat[k]);
+                local_sum.x +=
+                    v.x * static_cast<float>(local_vec[vals_per_item * k]);
+                local_sum.y +=
+                    v.y * static_cast<float>(local_vec[vals_per_item * k + 1]);
+                local_sum.x +=
+                    v.z * static_cast<float>(local_vec[vals_per_item * k + 2]);
+                local_sum.y +=
+                    v.w * static_cast<float>(local_vec[vals_per_item * k + 3]);
+
+                v = dequant_fp4(local_mat[k] >> 16);
+                local_sum.x +=
+                    v.x * static_cast<float>(local_vec[vals_per_item * k + 4]);
+                local_sum.y +=
+                    v.y * static_cast<float>(local_vec[vals_per_item * k + 5]);
+                local_sum.x +=
+                    v.z * static_cast<float>(local_vec[vals_per_item * k + 6]);
+                local_sum.y +=
+                    v.w * static_cast<float>(local_vec[vals_per_item * k + 7]);
+              }
+            }
+            sum += (local_sum.x + local_sum.y) * float(row_scales[i]);
           }
-          sum += (local_sum.x + local_sum.y) * float(row_scales[i]);
         }
         row_scales += scale_step;
       }
@@ -329,7 +395,7 @@ __global__ void fp_qmv_persistent(
 }
 
 template <typename F>
-void dispatch_1_2_4(int n, F&& f) {
+void dispatch_1_2_4_8(int n, F&& f) {
   switch (n) {
     case 1:
       f(std::integral_constant<int, 1>{});
@@ -339,6 +405,9 @@ void dispatch_1_2_4(int n, F&& f) {
       break;
     case 4:
       f(std::integral_constant<int, 4>{});
+      break;
+    case 8:
+      f(std::integral_constant<int, 8>{});
       break;
   }
 }
@@ -366,8 +435,21 @@ void fp_qmv(
       uint32_t blocks_y = (N + rows_per_block - 1) / rows_per_block;
       const uint32_t* mat_ptr = gpu_ptr<uint32_t>(mat);
       const T* vec_ptr = gpu_ptr<T>(vec);
+      // Determine alignment-based n_per_thread.
+      // n=8 only benefits DRAM-bound persistent kernel (more ILP hides
+      // DRAM latency); L2-cached shapes regress with n=8 due to reduced
+      // occupancy (67% vs 83%), so we cap at 4 for the single kernel path.
+      constexpr size_t kPersistentThreshold = 24 * 1024 * 1024;
+      bool use_persistent = (B == 1 && M == 1 &&
+          mat.nbytes() > kPersistentThreshold &&
+          K * int(sizeof(T)) <= 98304);
       int n = 1;
-      if (K % 32 == 0 && cu::is_aligned<4>(mat_ptr) &&
+      if (K % 64 == 0 && cu::is_aligned<8>(mat_ptr) &&
+          ((bits == 4 && cu::is_aligned<64>(vec_ptr)) ||
+           cu::is_aligned<8>(vec_ptr))) {
+        n = use_persistent ? 8 : 4;
+      } else if (
+          K % 32 == 0 && cu::is_aligned<4>(mat_ptr) &&
           ((bits == 4 && cu::is_aligned<8>(vec_ptr)) ||
            cu::is_aligned<4>(vec_ptr))) {
         n = 4;
@@ -377,7 +459,7 @@ void fp_qmv(
            cu::is_aligned<2>(vec_ptr))) {
         n = 2;
       }
-      dispatch_1_2_4(n, [&](auto n) {
+      dispatch_1_2_4_8(n, [&](auto n) {
         dispatch_bool(B > 1, [&](auto batched) {
           if (!batched.value) {
             // Persistent QMV for M=1: shared memory activation + contiguous
@@ -385,9 +467,7 @@ void fp_qmv(
             // Only beneficial when weights exceed L2 cache (24MB on SM121);
             // smaller shapes benefit from the original kernel's higher
             // occupancy since data is served from L2 at much higher BW.
-            constexpr size_t kPersistentThreshold = 24 * 1024 * 1024;
-            if (M == 1 && mat.nbytes() > kPersistentThreshold &&
-                K * int(sizeof(T)) <= 98304) {
+            if (use_persistent) {
               static int num_sms = 0;
               if (num_sms == 0) {
                 int dev;
