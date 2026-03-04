@@ -29,6 +29,7 @@
 #include "mlx/backend/cuda/utils.h"
 #include "mlx/dtype_utils.h"
 
+#include <cuda_fp4.h>
 #include <cuda_fp8.h>
 
 // Must include CUTLASS arch config BEFORE the guard check so the SM120/SM121
@@ -326,33 +327,6 @@ static void* get_or_reformat_sfb(
 //   - High occupancy: few registers per thread -> more warps per SM
 // ============================================================================
 
-// Quantize a float to 4-bit e2m1 encoding (1 sign + 2 exp + 1 mantissa).
-// Representable magnitudes: 0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0
-__device__ __forceinline__ uint8_t quantize_float_to_e2m1(float v) {
-  float av = fabsf(v);
-  uint8_t bits;
-  // Round to nearest representable value using midpoints.
-  if (av < 0.25f)
-    bits = 0b000; // 0
-  else if (av < 0.75f)
-    bits = 0b001; // 0.5
-  else if (av < 1.25f)
-    bits = 0b010; // 1.0
-  else if (av < 1.75f)
-    bits = 0b011; // 1.5
-  else if (av < 2.5f)
-    bits = 0b100; // 2.0
-  else if (av < 3.5f)
-    bits = 0b101; // 3.0
-  else if (av < 5.0f)
-    bits = 0b110; // 4.0
-  else
-    bits = 0b111; // 6.0
-  // Sign bit in bit 3.
-  if (v < 0.0f) bits |= 0b1000;
-  return bits;
-}
-
 // FP4 activation quantization — FP16 input, vectorized.
 // Each thread processes ELEMS_PER_THREAD=4 consecutive elements via uint2 load.
 // SF_VEC_SIZE: 16 (NVFP4) or 32 (MXFP4). Templated for compile-time optimization.
@@ -411,17 +385,15 @@ __global__ void quantize_activation_fp4_kernel(
     sf_out[sf_offset] = static_cast<SFType>(scale);
   }
 
-  // Quantize 4 values to 4 nibbles, pack into 2 bytes.
-  uint8_t q0 = quantize_float_to_e2m1(v0 * inv_scale);
-  uint8_t q1 = quantize_float_to_e2m1(v1 * inv_scale);
-  uint8_t q2 = quantize_float_to_e2m1(v2 * inv_scale);
-  uint8_t q3 = quantize_float_to_e2m1(v3 * inv_scale);
-
-  // Every thread writes 2 packed bytes (100% lane utilization).
+  // Quantize 4 values to 4 FP4 nibbles via hardware CVT, pack into 2 bytes.
+  // __nv_cvt_float2_to_fp4x2 converts 2 floats to packed FP4x2 in 1 CVT
+  // instruction, replacing the 8-way branch chain in quantize_float_to_e2m1().
   if (valid) {
+    float2 pair0 = make_float2(v0 * inv_scale, v1 * inv_scale);
+    float2 pair1 = make_float2(v2 * inv_scale, v3 * inv_scale);
     int out_base = m * (K / 2) + g * (SF_VEC_SIZE / 2) + local_lane * (ELEMS_PER_THREAD / 2);
-    output[out_base]     = q0 | (q1 << 4);
-    output[out_base + 1] = q2 | (q3 << 4);
+    output[out_base]     = __nv_cvt_float2_to_fp4x2(pair0, __NV_E2M1, cudaRoundNearest);
+    output[out_base + 1] = __nv_cvt_float2_to_fp4x2(pair1, __NV_E2M1, cudaRoundNearest);
   }
 }
 
@@ -481,15 +453,13 @@ __global__ void quantize_activation_fp4_bf16_kernel(
     sf_out[sf_offset] = static_cast<SFType>(scale);
   }
 
-  uint8_t q0 = quantize_float_to_e2m1(v0 * inv_scale);
-  uint8_t q1 = quantize_float_to_e2m1(v1 * inv_scale);
-  uint8_t q2 = quantize_float_to_e2m1(v2 * inv_scale);
-  uint8_t q3 = quantize_float_to_e2m1(v3 * inv_scale);
-
+  // Hardware FP4 quantization (same as FP16 kernel above).
   if (valid) {
+    float2 pair0 = make_float2(v0 * inv_scale, v1 * inv_scale);
+    float2 pair1 = make_float2(v2 * inv_scale, v3 * inv_scale);
     int out_base = m * (K / 2) + g * (SF_VEC_SIZE / 2) + local_lane * (ELEMS_PER_THREAD / 2);
-    output[out_base]     = q0 | (q1 << 4);
-    output[out_base + 1] = q2 | (q3 << 4);
+    output[out_base]     = __nv_cvt_float2_to_fp4x2(pair0, __NV_E2M1, cudaRoundNearest);
+    output[out_base + 1] = __nv_cvt_float2_to_fp4x2(pair1, __NV_E2M1, cudaRoundNearest);
   }
 }
 
