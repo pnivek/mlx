@@ -27,6 +27,7 @@ TRIALS = 10
 ITERS_PER_TRIAL = 50
 COOLDOWN = 0.1  # seconds between benchmarks
 DRAM_BW_GBS = 273  # DGX Spark sustained DRAM BW (GB/s)
+L2_CACHE_BYTES = 24 * 1024 * 1024  # 24 MB DGX Spark L2
 
 # DeepSeek V3.1 MoE layer dimensions
 DSV3_K = 7168
@@ -52,6 +53,18 @@ QUANT_MODES = [
 ]
 
 
+def flush_l2_cache():
+    """Write a buffer larger than L2 to evict all cached data.
+
+    Prevents test ordering from affecting results — small weight matrices
+    (e.g. Llama-7B FP4 = 8MB) can stay hot in L2 from a previous test,
+    inflating bandwidth numbers unpredictably.
+    """
+    buf = mx.zeros((L2_CACHE_BYTES // 2 + 1,), dtype=mx.float16)
+    mx.eval(buf)
+    del buf
+
+
 def tflops(M, N, K, secs):
     """Compute TFLOP/s for a matmul of shape (M,K) x (K,N)."""
     return 2.0 * M * N * K / secs / 1e12
@@ -67,6 +80,7 @@ def gbps(M, N, K, bits, secs):
 
 def bench_quantized_matmul(M, K, N, mode_cfg, dtype=mx.float16):
     """Benchmark mx.quantized_matmul for a single (M,K)x(N,K)^T configuration."""
+    flush_l2_cache()
     mode = mode_cfg["mode"]
     bits = mode_cfg["bits"]
     gs = mode_cfg["group_size"]
@@ -115,6 +129,7 @@ def bench_quantized_matmul(M, K, N, mode_cfg, dtype=mx.float16):
 
 def bench_dense_matmul(M, K, N, dtype=mx.float16):
     """Benchmark dense fp16 matmul for speedup reference."""
+    flush_l2_cache()
     x = mx.random.normal(shape=(M, K)).astype(dtype)
     w = mx.random.normal(shape=(N, K)).astype(dtype)
     mx.eval(x, w)
@@ -140,6 +155,7 @@ def bench_dense_matmul(M, K, N, dtype=mx.float16):
 
 def bench_gather_qmm(M, K, N, E, topk, mode_cfg, dtype=mx.float16):
     """Benchmark mx.gather_qmm (MoE expert dispatch)."""
+    flush_l2_cache()
     mode = mode_cfg["mode"]
     bits = mode_cfg["bits"]
     gs = mode_cfg["group_size"]
