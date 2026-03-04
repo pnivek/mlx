@@ -70,6 +70,7 @@ class LRUCache {
   void clear() {
     map_.clear();
     vlist_.clear();
+    cache_misses_ = 0;
   }
 
   iterator find(const K& key) {

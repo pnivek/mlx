@@ -97,6 +97,11 @@ class CommandEncoder {
   // Wait until kernels and completion handlers are finished
   void synchronize();
 
+  // Clear the CUDA graph cache, freeing graph workspace memory.
+  void clear_graph_cache() {
+    graph_cache_.clear();
+  }
+
  private:
   void add_kernel_node(const cudaKernelNodeParams& params);
   void add_kernel_node(const CUDA_KERNEL_NODE_PARAMS& params);
@@ -174,6 +179,9 @@ class Device {
     return memory_pools_ == 1;
   }
 
+  // Clear CUDA graph caches for all streams on this device.
+  void clear_graph_caches();
+
  private:
   int device_;
   int compute_capability_major_;
@@ -191,5 +199,6 @@ class Device {
 Device& device(int cuda_device);
 Device& device(mlx::core::Device d);
 CommandEncoder& get_command_encoder(Stream s);
+MLX_API void clear_graph_caches();
 
 } // namespace mlx::core::cu

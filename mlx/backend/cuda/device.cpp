@@ -519,4 +519,17 @@ CommandEncoder& get_command_encoder(Stream s) {
   return device(s.device).get_command_encoder(s);
 }
 
+void Device::clear_graph_caches() {
+  for (auto& [_, enc] : encoders_) {
+    enc.clear_graph_cache();
+  }
+}
+
+void clear_graph_caches() {
+  int device_count = gpu::device_count();
+  for (int i = 0; i < device_count; ++i) {
+    device(i).clear_graph_caches();
+  }
+}
+
 } // namespace mlx::core::cu
