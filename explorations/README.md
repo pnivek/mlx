@@ -13,6 +13,7 @@ port congestion that limits throughput when data is L2-resident.
 | 03 | [Tensor Core GEMV](03_tensor_core_gemv.md) | **NOT RECOMMENDED** | N/A | Extreme complexity |
 | 04 | [FP16 Accumulation (PTX)](04_fp16_accum_ptx.md) | **IMPLEMENTED** | 16-19% L2, 9% DRAM | Precision (verified OK) |
 | 05 | [HW PTX Activation Quant](05_hw_ptx_activation_quant.md) | **NO PERF GAIN** | 0% (kernel is memory-bound) | Low |
+| 06 | [cudaGraphExecUpdate Bug](06_cudaGraphExecUpdate_bug_sm121.md) | **WORKAROUND** | N/A (driver bug) | N/A |
 
 ## Implementation Results (nsys kernel-level, A/B tested)
 

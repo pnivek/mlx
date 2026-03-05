@@ -319,13 +319,18 @@ void CommandEncoder::add_kernel_node(
 void CommandEncoder::add_kernel_node(const cudaKernelNodeParams& params) {
   cudaGraphNode_t node;
   CHECK_CUDA_ERROR(cudaGraphAddKernelNode(&node, graph_, NULL, 0, &params));
-  insert_graph_dependencies(GraphNode{node, "K"});
+  // Include kernel function pointer in key so different kernels get different
+  // graph cache entries. Prevents cudaGraphExecUpdate from updating a cached
+  // exec with a completely different kernel, which corrupts execution on SM121.
+  auto key = fmt::format("K{:x}", reinterpret_cast<uintptr_t>(params.func));
+  insert_graph_dependencies(GraphNode{node, key});
 }
 
 void CommandEncoder::add_kernel_node(const CUDA_KERNEL_NODE_PARAMS& params) {
   CUgraphNode node;
   CHECK_CUDA_ERROR(cuGraphAddKernelNode(&node, graph_, NULL, 0, &params));
-  insert_graph_dependencies(GraphNode{node, "K"});
+  auto key = fmt::format("K{:x}", reinterpret_cast<uintptr_t>(params.func));
+  insert_graph_dependencies(GraphNode{node, key});
 }
 
 std::pair<std::string, bool> subgraph_to_key(cudaGraph_t graph) {
