@@ -237,26 +237,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
 
-  // Fused path: on-device sort + batch dequant + CUTLASS grouped GEMM.
-  // Requires dequanting all E experts at once. Use when the dequant buffer
-  // fits comfortably (< 8 GB) and weights are fully contiguous.
-  if (transpose_ && w.flags().row_contiguous && scales.flags().row_contiguous &&
-      (!biases || biases->flags().row_contiguous)) {
-    int E = w.shape(0);
-    size_t dequant_bytes =
-        static_cast<size_t>(E) * N * K * size_of(out.dtype());
-    constexpr size_t kMaxDequantBytes = 8ULL * 1024 * 1024 * 1024; // 8 GB
-    if (dequant_bytes <= kMaxDequantBytes) {
-      gather_qmm_gpu_fused(
-          x, w, scales, biases,
-          lhs_indices, rhs_indices,
-          out, transpose_, group_size_, bits_, mode_,
-          enc, s);
-      return;
-    }
-  }
-
-  // Fallback: host-side grouping path.
+  // Host-side grouping path: sync to read indices, per-expert dequant + cuBLAS.
   gather_qmm_gpu(
       x, w, scales, biases,
       lhs_indices, rhs_indices,

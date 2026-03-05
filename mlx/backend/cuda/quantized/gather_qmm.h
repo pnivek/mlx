@@ -36,25 +36,8 @@ void scatter_gather_output(
     int N,
     cu::CommandEncoder& enc);
 
-// Legacy path: host sync + per-expert cuBLAS GEMM loop.
+// Host-sync path: per-expert dequant + cuBLAS GEMM loop.
 void gather_qmm_gpu(
-    const array& x,
-    const array& w,
-    const array& scales,
-    const std::optional<array>& biases,
-    const array& lhs_indices,
-    const array& rhs_indices,
-    array& out,
-    bool transpose,
-    int group_size,
-    int bits,
-    QuantizationMode mode,
-    cu::CommandEncoder& enc,
-    const Stream& s);
-
-// Fused path: on-device counting sort + batch dequant + CUTLASS grouped GEMM.
-// Eliminates the host sync. Requires dequanting all E experts at once.
-void gather_qmm_gpu_fused(
     const array& x,
     const array& w,
     const array& scales,
