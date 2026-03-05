@@ -198,11 +198,12 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   int N = out.shape(-1);
   int B = lhs_indices.size();
 
-  // Fused on-device QMV path for FP modes during decode (small M).
+  // On-device QMV path for FP modes during decode (small M, moderate B).
   // Reads quantized weights directly — no dequant buffer needed.
-  // Small B: unsorted QMV (low overhead).
-  // Large B: sort indices by expert for L2 locality, then QMV + scatter.
-  if (transpose_ && M <= 16 && mode_ != QuantizationMode::Affine) {
+  // For large B (prefill: B = seq_len * topk, e.g. 8188), QMV is too slow
+  // because it reads the full weight matrix B times. The host-sync path
+  // groups by expert and only dequants active experts with cuBLAS.
+  if (transpose_ && M <= 16 && B <= 512 && mode_ != QuantizationMode::Affine) {
     // Make indices contiguous (MoE produces broadcast/strided 3D indices).
     array lhs_flat = ensure_row_contiguous(lhs_indices, enc, s);
     array rhs_flat = ensure_row_contiguous(rhs_indices, enc, s);
