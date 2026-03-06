@@ -221,8 +221,8 @@ std::pair<int, int> get_graph_limits(Device& d) {
       mb = 1000;
       break;
     case 1210: // DGX Spark / GB10 (128GB unified memory)
-      ops = 20;
-      mb = 25;
+      ops = 100;
+      mb = 200;
       break;
   }
   return {env::max_ops_per_buffer(ops), env::max_mb_per_buffer(mb)};
