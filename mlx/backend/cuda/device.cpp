@@ -1,5 +1,6 @@
 // Copyright © 2025 Apple Inc.
 
+#include "mlx/backend/cuda/allocator.h"
 #include "mlx/backend/cuda/device.h"
 #include "mlx/backend/cuda/jit_module.h"
 #include "mlx/backend/cuda/worker.h"
@@ -234,8 +235,7 @@ CommandEncoder::CommandEncoder(Device& d)
       worker_(d),
       graph_cache_(
           "MLX_CUDA_GRAPH_CACHE_SIZE",
-          /* default_capacity */
-          (d.compute_capability_major() >= 12) ? 100 : 400) {
+          /* default_capacity */ 400) {
   std::tie(max_ops_per_graph_, max_mb_per_graph_) = get_graph_limits(d);
 }
 
@@ -549,6 +549,8 @@ void clear_graph_caches() {
   for (int i = 0; i < device_count; ++i) {
     device(i).clear_graph_caches();
   }
+  // Trim memory pools to reclaim reserved memory from destroyed graph execs
+  allocator().trim_memory_pools();
 }
 
 } // namespace mlx::core::cu

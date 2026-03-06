@@ -66,6 +66,7 @@ class CudaAllocator : public allocator::Allocator {
   size_t get_cache_memory() const;
   size_t set_cache_limit(size_t limit);
   void clear_cache();
+  void trim_memory_pools();
 
  private:
   void free_cuda_buffer(CudaBuffer* buf);

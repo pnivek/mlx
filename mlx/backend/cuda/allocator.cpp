@@ -385,6 +385,14 @@ void CudaAllocator::clear_cache() {
   buffer_cache_.clear();
 }
 
+void CudaAllocator::trim_memory_pools() {
+  for (auto p : mem_pools_) {
+    if (p) {
+      cudaMemPoolTrimTo(p, 0);
+    }
+  }
+}
+
 CudaAllocator& allocator() {
   static auto* allocator_ = []() {
     // Ensure scheduler is created before allocator.
