@@ -220,8 +220,8 @@ std::pair<int, int> get_graph_limits(Device& d) {
       mb = 1000;
       break;
     case 1210: // DGX Spark / GB10 (128GB unified memory)
-      ops = 50;
-      mb = 400;
+      ops = 20;
+      mb = 25;
       break;
   }
   return {env::max_ops_per_buffer(ops), env::max_mb_per_buffer(mb)};
@@ -232,7 +232,10 @@ CommandEncoder::CommandEncoder(Device& d)
       stream_(d),
       graph_(d),
       worker_(d),
-      graph_cache_("MLX_CUDA_GRAPH_CACHE_SIZE", /* default_capacity */ 400) {
+      graph_cache_(
+          "MLX_CUDA_GRAPH_CACHE_SIZE",
+          /* default_capacity */
+          (d.compute_capability_major() >= 12) ? 100 : 400) {
   std::tie(max_ops_per_graph_, max_mb_per_graph_) = get_graph_limits(d);
 }
 
@@ -533,6 +536,19 @@ Device& device(mlx::core::Device d) {
 
 CommandEncoder& get_command_encoder(Stream s) {
   return device(s.device).get_command_encoder(s);
+}
+
+void Device::clear_graph_caches() {
+  for (auto& [_, enc] : encoders_) {
+    enc.clear_graph_cache();
+  }
+}
+
+void clear_graph_caches() {
+  int device_count = gpu::device_count();
+  for (int i = 0; i < device_count; ++i) {
+    device(i).clear_graph_caches();
+  }
 }
 
 } // namespace mlx::core::cu

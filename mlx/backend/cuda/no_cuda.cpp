@@ -11,6 +11,10 @@ bool is_available() {
   return false;
 }
 
+void clear_graph_caches() {
+  // No-op when CUDA is not available.
+}
+
 } // namespace cu
 
 namespace fast {

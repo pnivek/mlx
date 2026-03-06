@@ -18,4 +18,7 @@ MLX_API const
     std::unordered_map<std::string, std::variant<std::string, size_t>>&
     device_info(int device_index = 0);
 
+/* Clear all CUDA graph caches across all devices and streams. */
+MLX_API void clear_graph_caches();
+
 } // namespace mlx::core::cu
