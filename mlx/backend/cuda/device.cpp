@@ -553,4 +553,8 @@ void clear_graph_caches() {
   allocator().trim_memory_pools();
 }
 
+std::pair<size_t, size_t> get_pool_memory() {
+  return allocator().get_pool_memory();
+}
+
 } // namespace mlx::core::cu

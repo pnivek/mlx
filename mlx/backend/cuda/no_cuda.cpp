@@ -15,6 +15,10 @@ void clear_graph_caches() {
   // No-op when CUDA is not available.
 }
 
+std::pair<size_t, size_t> get_pool_memory() {
+  return {0, 0};
+}
+
 } // namespace cu
 
 namespace fast {

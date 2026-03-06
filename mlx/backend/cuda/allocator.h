@@ -67,6 +67,7 @@ class CudaAllocator : public allocator::Allocator {
   size_t set_cache_limit(size_t limit);
   void clear_cache();
   void trim_memory_pools();
+  std::pair<size_t, size_t> get_pool_memory() const;
 
  private:
   void free_cuda_buffer(CudaBuffer* buf);
@@ -83,7 +84,6 @@ class CudaAllocator : public allocator::Allocator {
   BufferCache<CudaBuffer> buffer_cache_;
   size_t active_memory_{0};
   size_t peak_memory_{0};
-  std::vector<CudaStream> free_streams_;
   std::vector<cudaMemPool_t> mem_pools_;
   SmallSizePool scalar_pool_;
 };

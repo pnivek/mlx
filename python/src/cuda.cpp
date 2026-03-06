@@ -1,6 +1,7 @@
 // Copyright © 2023-2025 Apple Inc.
 
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/pair.h>
 
 #include "mlx/backend/cuda/cuda.h"
 
@@ -27,5 +28,16 @@ void init_cuda(nb::module_& m) {
       Unlike :func:`mlx.core.clear_cache` which only clears buffer cache,
       this clears the compiled CUDA graph executables that accumulate
       when running kernels with different configurations.
+      )pbdoc");
+
+  cuda.def(
+      "get_pool_memory",
+      &mx::cu::get_pool_memory,
+      R"pbdoc(
+      Get CUDA memory pool statistics.
+
+      Returns:
+          tuple: (reserved, used) in bytes. Reserved is the total physical
+          memory held by the pool; used is the subset currently allocated.
       )pbdoc");
 }

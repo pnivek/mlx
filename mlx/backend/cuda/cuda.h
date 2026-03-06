@@ -4,6 +4,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <variant>
 
 #include "mlx/api.h"
@@ -20,5 +21,8 @@ MLX_API const
 
 /* Clear all CUDA graph caches across all devices and streams. */
 MLX_API void clear_graph_caches();
+
+/* Get CUDA memory pool stats: (reserved, used) in bytes. */
+MLX_API std::pair<size_t, size_t> get_pool_memory();
 
 } // namespace mlx::core::cu

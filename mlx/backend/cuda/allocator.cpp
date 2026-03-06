@@ -172,13 +172,16 @@ CudaAllocator::CudaAllocator()
   CHECK_CUDA_ERROR(cudaGetDevice(&curr));
 
   int device_count = gpu::device_count();
-  free_streams_.resize(device_count);
   mem_pools_.resize(device_count);
   for (int i = 0; i < device_count; ++i) {
     auto& d = device(i);
     if (d.memory_pools()) {
-      free_streams_[i] = CudaStream(d);
       CHECK_CUDA_ERROR(cudaDeviceGetDefaultMemPool(&mem_pools_[i], i));
+      // Set release threshold so pool trims reserved memory automatically.
+      // Without this, CUDA default is UINT64_MAX (never release).
+      uint64_t threshold = free_limit_;
+      cudaMemPoolSetAttribute(
+          mem_pools_[i], cudaMemPoolAttrReleaseThreshold, &threshold);
     }
   }
   CHECK_CUDA_ERROR(cudaSetDevice(curr));
@@ -238,19 +241,19 @@ CudaAllocator::malloc_async(size_t size, int device, cudaStream_t stream) {
     }
     lock.lock();
 
-    // If any cuda memory pool has too much reserved memory, clear some
-    // memory from the cache. This prevents graph / kernel execution failing
-    // from OOM
-    if (get_cache_memory() > 0) {
-      for (auto p : mem_pools_) {
-        if (p) {
-          size_t used = 0;
-          CHECK_CUDA_ERROR(cudaMemPoolGetAttribute(
-              p, cudaMemPoolAttrReservedMemCurrent, &used));
-          if (used > (total_memory_ - free_limit_)) {
-            buffer_cache_.release_cached_buffers(free_limit_);
-            break;
-          }
+    // If total memory pressure (active + cache + pool reserved) is too high,
+    // release cache and trim pool to prevent OOM.
+    for (auto p : mem_pools_) {
+      if (p) {
+        size_t pool_reserved = 0;
+        CHECK_CUDA_ERROR(cudaMemPoolGetAttribute(
+            p, cudaMemPoolAttrReservedMemCurrent, &pool_reserved));
+        size_t total_pressure =
+            get_active_memory() + get_cache_memory() + pool_reserved;
+        if (total_pressure > memory_limit_) {
+          buffer_cache_.release_cached_buffers(free_limit_);
+          cudaMemPoolTrimTo(p, 0);
+          break;
         }
       }
     }
@@ -338,7 +341,11 @@ void CudaAllocator::free_async(CudaBuffer& buf, cudaStream_t stream) {
     // Free asynchronously when memory pools is supported.
     if (mem_pools_[buf.device]) {
       if (!stream) {
-        stream = free_streams_[buf.device];
+        // Cache eviction path: buffer is no longer in use by any stream.
+        // Free on the legacy default stream which has implicit barriers with
+        // all blocking streams, so the pool can reuse this memory for future
+        // cudaMallocAsync calls on any compute stream.
+        stream = cudaStreamLegacy;
       }
       CHECK_CUDA_ERROR(cudaFreeAsync(buf.data, stream));
     } else {
@@ -391,6 +398,20 @@ void CudaAllocator::trim_memory_pools() {
       cudaMemPoolTrimTo(p, 0);
     }
   }
+}
+
+std::pair<size_t, size_t> CudaAllocator::get_pool_memory() const {
+  size_t reserved = 0, used = 0;
+  for (auto p : mem_pools_) {
+    if (p) {
+      size_t r = 0, u = 0;
+      cudaMemPoolGetAttribute(p, cudaMemPoolAttrReservedMemCurrent, &r);
+      cudaMemPoolGetAttribute(p, cudaMemPoolAttrUsedMemCurrent, &u);
+      reserved += r;
+      used += u;
+    }
+  }
+  return {reserved, used};
 }
 
 CudaAllocator& allocator() {
