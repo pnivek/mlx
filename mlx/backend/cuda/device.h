@@ -13,6 +13,7 @@
 #include <cudnn.h>
 
 #include <unordered_map>
+#include <utility>
 
 namespace mlx::core::cu {
 
@@ -218,5 +219,6 @@ Device& device(int cuda_device);
 Device& device(mlx::core::Device d);
 CommandEncoder& get_command_encoder(Stream s);
 MLX_API void clear_graph_caches();
+MLX_API std::pair<size_t, size_t> get_pool_memory();
 
 } // namespace mlx::core::cu
