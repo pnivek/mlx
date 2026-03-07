@@ -3,6 +3,8 @@
 #include "mlx/backend/cuda/quantized/quantized.h"
 #include "mlx/backend/cuda/device.h"
 #include "mlx/backend/cuda/gemms/cublas_gemm.h"
+#include "mlx/backend/cuda/quantized/gather_qmm.h"
+#include "mlx/backend/cuda/quantized/gather_qmv.h"
 #include "mlx/backend/cuda/quantized/qmm/cute_qmm.h"
 #include "mlx/backend/cuda/quantized/qmm/qmm.h"
 #include "mlx/backend/cuda/quantized/qmm_sm120.h"
@@ -226,6 +228,81 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           bits_,
           group_size_,
           quantization_mode_to_string(mode_)));
+}
+
+void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
+  nvtx3::scoped_range r("GatherQMM::eval_gpu");
+  auto& s = stream();
+  auto& d = cu::device(s.device);
+  auto& enc = d.get_command_encoder(s);
+
+  out.set_data(cu::malloc_async(out.nbytes(), enc));
+
+  array x = ensure_row_contiguous_matrix(inputs[0], enc, s);
+  array w = ensure_row_contiguous_matrix(inputs[1], enc, s);
+  array scales = ensure_row_contiguous_matrix(inputs[2], enc, s);
+  std::optional<array> biases = std::nullopt;
+
+  // Inputs layout: x, w, scales, [biases], lhs_indices, rhs_indices
+  // Affine mode has biases; FP modes do not.
+  if (mode_ == QuantizationMode::Affine) {
+    biases = ensure_row_contiguous_matrix(inputs[3], enc, s);
+  }
+
+  const array& lhs_indices = inputs[inputs.size() - 2];
+  const array& rhs_indices = inputs[inputs.size() - 1];
+
+  int M = x.shape(-2);
+  int K = x.shape(-1);
+  int N = out.shape(-1);
+  int B = lhs_indices.size();
+
+  // On-device QMV path for FP modes during decode (small M, moderate B).
+  // Reads quantized weights directly — no dequant buffer needed.
+  // For large B (prefill: B = seq_len * topk, e.g. 8188), QMV is too slow
+  // because it reads the full weight matrix B times. The host-sync path
+  // groups by expert and only dequants active experts with cuBLAS.
+  if (transpose_ && M <= 16 && B <= 512 && mode_ != QuantizationMode::Affine) {
+    // Make indices contiguous (MoE produces broadcast/strided 3D indices).
+    array lhs_flat = ensure_row_contiguous(lhs_indices, enc, s);
+    array rhs_flat = ensure_row_contiguous(rhs_indices, enc, s);
+
+    if (B <= 256) {
+      // Small B: direct QMV, no sort needed.
+      cu::fp_gather_qmv(
+          w, scales, x, lhs_flat, rhs_flat, out,
+          bits_, group_size_, M, N, K, B, enc);
+    } else {
+      // Large B: sort by expert for L2 weight reuse, QMV into temp, scatter.
+      // Avoids dequanting all E experts (e.g. DSv3 = 5.16 GB FP16 buffer).
+      // Use direct kernel launches (bypass CUDA graph) to work around
+      // cudaGraphExecUpdate issues on SM121/CUDA 13.0.
+      enc.commit();
+      enc.begin_direct_launch();
+      int E = w.shape(0);
+      auto sorted = sort_gather_indices(lhs_flat, rhs_flat, B, E, enc, s);
+
+      // Allocate temp output in sorted order.
+      array temp_out(out.shape(), out.dtype(), nullptr, {});
+      temp_out.set_data(cu::malloc_async(out.nbytes(), enc));
+      enc.add_temporary(temp_out);
+
+      cu::fp_gather_qmv(
+          w, scales, x, sorted.sorted_lhs, sorted.sorted_rhs, temp_out,
+          bits_, group_size_, M, N, K, B, enc);
+
+      scatter_gather_output(temp_out, sorted.sorted_perm, out, B, M, N, enc);
+      enc.end_direct_launch();
+    }
+    return;
+  }
+
+  // Host-side grouping path: sync to read indices, per-expert dequant + cuBLAS.
+  gather_qmm_gpu(
+      x, w, scales, biases,
+      lhs_indices, rhs_indices,
+      out, transpose_, group_size_, bits_, mode_,
+      enc, s);
 }
 
 void fast::Quantize::eval_gpu(
