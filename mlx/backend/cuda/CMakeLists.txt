@@ -58,6 +58,8 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized/affine_quantize.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized/fp_quantize.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized/quantized.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/quantized/qmm_sm120.cu
+          ${CMAKE_CURRENT_SOURCE_DIR}/quantized/qmv.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized/qqmm.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized/qqmm_utils.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized/convert_fp8.cu
