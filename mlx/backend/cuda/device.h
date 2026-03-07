@@ -13,6 +13,7 @@
 #include <cudnn.h>
 
 #include <unordered_map>
+#include <utility>
 
 namespace mlx::core::cu {
 
@@ -101,6 +102,22 @@ class CommandEncoder {
   bool needs_commit();
   void commit();
 
+  // Force current graph to be instantiated fresh instead of updating a cached
+  // graph exec. Use this when cudaGraphExecUpdate produces incorrect results
+  // (e.g. SM121/CUDA 13.0 with variable-size grid dims).
+  void disable_graph_update() {
+    is_graph_updatable_ = false;
+  }
+
+  // Bypass CUDA graph capture and launch kernels directly on the stream.
+  // Use after synchronize() when graph interactions cause issues.
+  void begin_direct_launch() {
+    direct_launch_ = true;
+  }
+  void end_direct_launch() {
+    direct_launch_ = false;
+  }
+
   Device& device() {
     return device_;
   }
@@ -111,6 +128,11 @@ class CommandEncoder {
 
   // Wait until kernels and completion handlers are finished
   void synchronize();
+
+  // Clear the CUDA graph cache, freeing graph workspace memory.
+  void clear_graph_cache() {
+    graph_cache_.clear();
+  }
 
  private:
   cudaGraphNode_t add_kernel_node_raw(const cudaKernelNodeParams& params);
@@ -135,6 +157,7 @@ class CommandEncoder {
   Worker worker_;
   int node_count_{0};
   bool in_concurrent_{false};
+  bool direct_launch_{false};
   std::vector<cudaGraphNode_t> from_nodes_;
   std::vector<cudaGraphNode_t> to_nodes_;
   std::string graph_nodes_key_;
@@ -189,6 +212,9 @@ class Device {
     return memory_pools_ == 1;
   }
 
+  // Clear CUDA graph caches for all streams on this device.
+  void clear_graph_caches();
+
  private:
   int device_;
   int compute_capability_major_;
@@ -206,5 +232,7 @@ class Device {
 Device& device(int cuda_device);
 Device& device(mlx::core::Device d);
 CommandEncoder& get_command_encoder(Stream s);
+MLX_API void clear_graph_caches();
+MLX_API std::pair<size_t, size_t> get_pool_memory();
 
 } // namespace mlx::core::cu
