@@ -824,7 +824,13 @@ array scaled_dot_product_attention(
 
   bool is_training = detail::in_grad_tracing();
   bool has_fast_vjp = !ScaledDotProductAttentionVJP::use_fallback(q, stream);
-  bool output_logsumexp = is_training && has_fast_vjp;
+  // Request logsumexp stats from cuDNN when we need to correct for sinks
+  // during inference. The vector kernel (L_q < 4) handles sinks natively,
+  // so this is only needed for the cuDNN path (L_q >= 4).
+  bool needs_lse_for_sinks = has_sinks && !is_training && q.shape(2) >= 4;
+  bool output_logsumexp =
+      (is_training && has_fast_vjp) || needs_lse_for_sinks;
+
   if (!ScaledDotProductAttention::use_fallback(
           q,
           k,
@@ -834,7 +840,10 @@ array scaled_dot_product_attention(
           do_causal,
           is_training,
           output_logsumexp,
-          stream)) {
+          stream) &&
+      // Training with sinks still uses the fallback because the VJP
+      // cannot differentiate through the logsumexp sink correction.
+      !(has_sinks && is_training)) {
     if (has_bool_mask && !ScaledDotProductAttention::supports_bool_mask()) {
       // Convert bool mask to additive mask.
       float inf = std::numeric_limits<float>::infinity();
@@ -848,11 +857,27 @@ array scaled_dot_product_attention(
     auto primitive = std::make_shared<ScaledDotProductAttention>(
         stream, fallback, scale, do_causal, has_sinks, output_logsumexp);
     if (output_logsumexp) {
-      return array::make_arrays(
-          {std::move(out_shape), Shape{q.shape(0), q.shape(1), q.shape(2), 1}},
+      auto results = array::make_arrays(
+          {out_shape, Shape{q.shape(0), q.shape(1), q.shape(2), 1}},
           {final_type, float32},
           primitive,
-          std::move(inputs))[0];
+          std::move(inputs));
+      if (needs_lse_for_sinks) {
+        // cuDNN SDPA doesn't support attention sinks, but we can correct
+        // its output using the logsumexp statistics it provides.
+        //
+        // Math: cuDNN computes Z' = sum_k exp(s_k) and
+        //   out' = sum_k (exp(s_k)/Z') * v_k
+        // With sinks, the normalizer becomes Z = Z' + exp(sink), so:
+        //   out = out' * Z'/Z = out' * sigmoid(log(Z') - sink)
+        //       = out' * sigmoid(lse - sink)
+        auto sinks_f32 = expand_dims(
+            astype(*sinks, float32, s), {0, 2, 3}, s);
+        auto correction = sigmoid(subtract(results[1], sinks_f32, s), s);
+        return multiply(
+            results[0], astype(correction, final_type, s), s);
+      }
+      return results[0];
     } else {
       return array(
           std::move(out_shape), final_type, primitive, std::move(inputs));
