@@ -59,6 +59,8 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized/affine_quantize.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized/fp_quantize.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized/quantized.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/quantized/qmm_sm120.cu
+          ${CMAKE_CURRENT_SOURCE_DIR}/quantized/qmv.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized/qqmm.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized/qqmm_utils.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized/convert_fp8.cu
@@ -146,6 +148,14 @@ if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8.0)
     mlx PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:--compress-mode=size>")
 endif()
 
+# SM120 CUTLASS block-scaled GEMM uses cudaFuncSetAttribute() for shared memory
+# opt-in on __global__ template functions. The default CUDA_VISIBILITY_PRESET=hidden
+# causes nvcc to give these functions LOCAL linkage, making them invisible to the
+# CUDA runtime API. This flag restores normal (GLOBAL) linkage for __global__
+# functions so cudaFuncSetAttribute() can resolve them correctly.
+target_compile_options(
+  mlx PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:--device-entity-has-hidden-visibility=false>")
+
 # Use native CUDA arch by default.
 if(NOT DEFINED MLX_CUDA_ARCHITECTURES)
   execute_process(
@@ -156,9 +166,12 @@ if(NOT DEFINED MLX_CUDA_ARCHITECTURES)
     message(
       FATAL_ERROR
         "Can not get native CUDA arch, must set MLX_CUDA_ARCHITECTURES")
-  elseif(MLX_CUDA_ARCHITECTURES GREATER_EQUAL 90)
-    # Use arch-specific compute capability whenever possible.
-    set(MLX_CUDA_ARCHITECTURES "${MLX_CUDA_ARCHITECTURES}a")
+  else()
+    set(UPGRADABLE_ARCHITECTURES "90;100;121")
+    if(MLX_CUDA_ARCHITECTURES IN_LIST UPGRADABLE_ARCHITECTURES)
+      # Use arch-specific compute capability whenever possible.
+      set(MLX_CUDA_ARCHITECTURES "${MLX_CUDA_ARCHITECTURES}a")
+    endif()
   endif()
 endif()
 message(STATUS "CUDA architectures: ${MLX_CUDA_ARCHITECTURES}")
