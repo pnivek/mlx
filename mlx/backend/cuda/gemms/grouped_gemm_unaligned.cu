@@ -357,4 +357,32 @@ void cutlass_grouped_gemm_unaligned(
       encoder);
 }
 
+void cutlass_grouped_gemm_run(
+    bool a_transposed,
+    bool b_transposed,
+    int group_count,
+    void* problem_sizes_gpu,
+    int64_t* a_lds_gpu,
+    int64_t* b_lds_gpu,
+    int64_t* out_lds_gpu,
+    void** a_ptrs_gpu,
+    void** b_ptrs_gpu,
+    void** out_ptrs_gpu,
+    Dtype dtype,
+    int N,
+    cu::CommandEncoder& encoder) {
+  auto* fun = get_grouped_mm_funcion(dtype, N, encoder.device());
+  fun(a_transposed,
+      b_transposed,
+      group_count,
+      reinterpret_cast<ProblemSize*>(problem_sizes_gpu),
+      a_lds_gpu,
+      b_lds_gpu,
+      out_lds_gpu,
+      a_ptrs_gpu,
+      b_ptrs_gpu,
+      out_ptrs_gpu,
+      encoder);
+}
+
 } // namespace mlx::core
