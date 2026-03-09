@@ -319,6 +319,12 @@ void gather_qmm_gpu(
   enc.set_input_array(rhs_flat);
   enc.synchronize();
 
+  // Use direct kernel launches (bypass CUDA graph) to work around
+  // cudaGraphExecUpdate issues on SM121/CUDA 13.0. The per-expert loop
+  // creates a variable number of graph nodes depending on which experts
+  // are active, causing graph topology mismatches on update.
+  enc.begin_direct_launch();
+
   std::vector<uint32_t> lhs_host(B), rhs_host(B);
   CHECK_CUDA_ERROR(cudaMemcpy(
       lhs_host.data(),
@@ -443,13 +449,13 @@ void gather_qmm_gpu(
     if (x_elem_size == 2) {
       enc.add_kernel_node(
           gather_rows_kernel<__half>,
-          grid, block, 0,
+          grid, block,
           gpu_ptr<__half>(x), gpu_ptr<__half>(x_gathered),
           gather_ptr, num_items, M, K);
     } else {
       enc.add_kernel_node(
           gather_rows_kernel<float>,
-          grid, block, 0,
+          grid, block,
           gpu_ptr<float>(x), gpu_ptr<float>(x_gathered),
           gather_ptr, num_items, M, K);
     }
@@ -482,17 +488,19 @@ void gather_qmm_gpu(
     if (out_elem_size == 2) {
       enc.add_kernel_node(
           scatter_rows_kernel<__half>,
-          grid, block, 0,
+          grid, block,
           gpu_ptr<__half>(out_gathered), gpu_ptr<__half>(out),
           scatter_ptr, num_items, M, N);
     } else {
       enc.add_kernel_node(
           scatter_rows_kernel<float>,
-          grid, block, 0,
+          grid, block,
           gpu_ptr<float>(out_gathered), gpu_ptr<float>(out),
           scatter_ptr, num_items, M, N);
     }
   }
+
+  enc.end_direct_launch();
 }
 
 } // namespace mlx::core
