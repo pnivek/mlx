@@ -103,7 +103,7 @@ cudnnHandle_t Device::get_cudnn_handle() {
 
 CommandEncoder::CaptureContext::CaptureContext(CommandEncoder& enc) : enc(enc) {
   enc.device().make_current();
-  if (!use_cuda_graphs()) {
+  if (!use_cuda_graphs() || enc.direct_launch_) {
     return;
   }
   CHECK_CUDA_ERROR(
@@ -111,7 +111,7 @@ CommandEncoder::CaptureContext::CaptureContext(CommandEncoder& enc) : enc(enc) {
 }
 
 CommandEncoder::CaptureContext::~CaptureContext() {
-  if (!use_cuda_graphs()) {
+  if (!use_cuda_graphs() || enc.direct_launch_) {
     enc.node_count_++;
     return;
   }

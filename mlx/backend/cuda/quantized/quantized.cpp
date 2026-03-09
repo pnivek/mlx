@@ -259,9 +259,8 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   // On-device QMV path for FP modes during decode (small M, moderate B).
   // Reads quantized weights directly — no dequant buffer needed.
-  // For large B (prefill: B = seq_len * topk, e.g. 8188), QMV is too slow
-  // because it reads the full weight matrix B times. The host-sync path
-  // groups by expert and only dequants active experts with cuBLAS.
+  // For large B (prefill), the host-sync dequant+GEMM path is faster
+  // because it reads each expert's weights only once.
   if (transpose_ && M <= 16 && B <= 512 && mode_ != QuantizationMode::Affine) {
     // Make indices contiguous (MoE produces broadcast/strided 3D indices).
     array lhs_flat = ensure_row_contiguous(lhs_indices, enc, s);
@@ -274,7 +273,6 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
           bits_, group_size_, M, N, K, B, enc);
     } else {
       // Large B: sort by expert for L2 weight reuse, QMV into temp, scatter.
-      // Avoids dequanting all E experts (e.g. DSv3 = 5.16 GB FP16 buffer).
       // Use direct kernel launches (bypass CUDA graph) to work around
       // cudaGraphExecUpdate issues on SM121/CUDA 13.0.
       enc.commit();
@@ -296,6 +294,10 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     }
     return;
   }
+
+  // Ensure cuBLAS handle exists before synchronize — creating it after
+  // synchronize can fail with CUBLAS_STATUS_ALLOC_FAILED on SM121/CUDA 13.0.
+  d.get_cublaslt_handle();
 
   // Host-side grouping path: sync to read indices, per-expert dequant + cuBLAS.
   gather_qmm_gpu(
