@@ -309,6 +309,63 @@ DnnGraph build_sdpa_backward_graph(
   return graph;
 }
 
+// Pad tensor's dim-2 from current size to T_target with zeros.
+// Used to pad K/V from [B,H,T_kv,D] to [B,H,T_q,D].
+array pad_seq_dim(
+    const array& x,
+    int T_target,
+    cu::CommandEncoder& enc,
+    Stream s) {
+  if (x.shape(2) >= T_target)
+    return x;
+  Shape shape = x.shape();
+  shape[2] = T_target;
+  array padded(shape, x.dtype(), nullptr, {});
+  padded.set_data(cu::malloc_async(padded.nbytes(), enc));
+  // Zero entire buffer (padded positions stay zero)
+  cudaMemsetAsync(padded.data<void>(), 0, padded.nbytes(), enc.stream());
+  // Create a view of padded[:,:,:T_kv,:] and copy x into it
+  auto padded_strides = make_contiguous_strides(shape);
+  array dst_view(x.shape(), padded.dtype(), nullptr, {});
+  dst_view.copy_shared_buffer(
+      padded,
+      padded_strides,
+      {false, false, false},
+      padded.data_size(),
+      0);
+  copy_gpu(x, dst_view, CopyType::GeneralGeneral, s);
+  return padded;
+}
+
+// Pad mask's last dim from T_kv to T_target with "don't attend" values.
+// Mask shape: [B,H,T_q,T_kv] -> [B,H,T_q,T_target].
+array pad_mask_dim(
+    const array& mask,
+    int T_target,
+    cu::CommandEncoder& enc,
+    Stream s) {
+  if (mask.shape(-1) >= T_target)
+    return mask;
+  Shape shape = mask.shape();
+  shape.back() = T_target;
+  array padded(shape, mask.dtype(), nullptr, {});
+  padded.set_data(cu::malloc_async(padded.nbytes(), enc));
+  // Fill with 0xFF: gives -NaN for bf16/fp16 which acts as "don't attend"
+  // in softmax (exp(-NaN) = 0)
+  cudaMemsetAsync(padded.data<void>(), 0xFF, padded.nbytes(), enc.stream());
+  // Copy valid mask into first T_kv columns
+  auto padded_strides = make_contiguous_strides(shape);
+  array dst_view(mask.shape(), padded.dtype(), nullptr, {});
+  dst_view.copy_shared_buffer(
+      padded,
+      padded_strides,
+      {false, false, false},
+      padded.data_size(),
+      0);
+  copy_gpu(mask, dst_view, CopyType::GeneralGeneral, s);
+  return padded;
+}
+
 } // namespace
 
 bool supports_sdpa_cudnn(
@@ -383,12 +440,39 @@ void sdpa_cudnn(
     encoder.add_temporary(v);
   }
 
+  // For prefill with mask where T_q > T_kv (e.g., windowed attention with
+  // RotatingKVCache), pad K/V and mask to T_q and use padding mask.
+  // cuDNN crashes with T_q > T_kv + bias mask on some architectures.
+  std::optional<array> mask_padded;
+  if (!decoding && mask_arr && q.shape(2) > k.shape(2)) {
+    int B = q.shape(0);
+    int T_q = q.shape(2);
+    int T_kv = k.shape(2);
+
+    std::vector<int> seq_len_q_vec(B, T_q);
+    std::vector<int> seq_len_kv_vec(B, T_kv);
+    seq_len_q = array(seq_len_q_vec.begin(), {B, 1, 1, 1});
+    seq_len_kv = array(seq_len_kv_vec.begin(), {B, 1, 1, 1});
+    encoder.add_temporary(*seq_len_q);
+    encoder.add_temporary(*seq_len_kv);
+
+    k = pad_seq_dim(k, T_q, encoder, s);
+    v = pad_seq_dim(v, T_q, encoder, s);
+    encoder.add_temporary(k);
+    encoder.add_temporary(v);
+
+    mask_padded = pad_mask_dim(*mask_arr, T_q, encoder, s);
+    encoder.add_temporary(*mask_padded);
+  }
+  // Use padded mask if available
+  const auto& effective_mask = mask_padded ? mask_padded : mask_arr;
+
   encoder.set_input_array(q);
   encoder.set_input_array(k);
   encoder.set_input_array(v);
   encoder.set_output_array(o);
-  if (mask_arr) {
-    encoder.set_input_array(*mask_arr);
+  if (effective_mask) {
+    encoder.set_input_array(*effective_mask);
   }
   if (sinks) {
     encoder.set_input_array(*sinks);
@@ -404,7 +488,15 @@ void sdpa_cudnn(
 
   // Search cache.
   auto cache_key = build_sdpa_cache_key(
-      encoder, q, k, v, do_causal, mask_arr, sinks, decoding, output_logsumexp);
+      encoder,
+      q,
+      k,
+      v,
+      do_causal,
+      effective_mask,
+      sinks,
+      decoding,
+      output_logsumexp);
   auto it = sdpa_cache().find(cache_key);
   if (it == sdpa_cache().end()) {
     auto graph = build_sdpa_graph(
@@ -413,7 +505,7 @@ void sdpa_cudnn(
         k,
         v,
         do_causal,
-        mask_arr,
+        effective_mask,
         sinks,
         seq_len_q,
         seq_len_kv,
@@ -430,8 +522,8 @@ void sdpa_cudnn(
       {V, gpu_ptr<void>(v)},
       {SCALE, &scale},
       {O, gpu_ptr<void>(o)}};
-  if (mask_arr) {
-    variant_pack[BIAS] = gpu_ptr<void>(*mask_arr);
+  if (effective_mask) {
+    variant_pack[BIAS] = gpu_ptr<void>(*effective_mask);
   }
   if (sinks) {
     variant_pack[SINKS] = gpu_ptr<void>(*sinks);
