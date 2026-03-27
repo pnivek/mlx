@@ -6,11 +6,16 @@ Methodology: 10 trials of 50 iterations each, reports median.
 Each iteration calls mx.eval() to force discrete kernel execution.
 DRAM BW% column assumes 273 GB/s sustained (DGX Spark LPDDR5x).
 
+Optimization targets:
+  Prefill score = mean TFLOP/s at M=128,512,1024 (Spark's primary job in exo disagg)
+  Decode score  = mean %DRAM at M=1 (want >50% — means BW-bound, not overhead-bound)
+
 Usage:
     python bench_qmm.py              # run all benchmarks
-    python bench_qmm.py --qmm       # only QuantizedMatmul
+    python bench_qmm.py --qmm        # only QuantizedMatmul
     python bench_qmm.py --gather     # only GatherQMM
     python bench_qmm.py --sweep      # batch size sweep
+    python bench_qmm.py --scores     # print prefill/decode summary scores only
 """
 import argparse
 import time
@@ -35,8 +40,23 @@ DSV3_N = 1407
 DSV3_E = 256
 DSV3_TOPK = 8
 
-# Typical LLM hidden sizes
+# Model configs: square attention/projection layers + FFN up/down layers
+# FFN shapes matter — they're asymmetric and hit different dispatch paths
 MODELS = {
+    "Llama-7B":       {"K": 4096,  "N": 4096},   # attn proj / hidden
+    "Llama-7B-FFN-up":   {"K": 4096,  "N": 11008},  # gate/up
+    "Llama-7B-FFN-down": {"K": 11008, "N": 4096},   # down
+    "Llama-13B":      {"K": 5120,  "N": 5120},
+    "Llama-13B-FFN-up":  {"K": 5120,  "N": 13568},
+    "Llama-13B-FFN-down":{"K": 13568, "N": 5120},
+    "Llama-70B":      {"K": 8192,  "N": 8192},
+    "Llama-70B-FFN-up":  {"K": 8192,  "N": 28672},
+    "Llama-70B-FFN-down":{"K": 28672, "N": 8192},
+    "DSv3-MLP":       {"K": DSV3_K, "N": DSV3_N},
+}
+
+# Canonical models for prefill/decode scoring (skip FFN variants to keep it fast)
+SCORE_MODELS = {
     "Llama-7B":  {"K": 4096,  "N": 4096},
     "Llama-13B": {"K": 5120,  "N": 5120},
     "Llama-70B": {"K": 8192,  "N": 8192},
@@ -51,6 +71,10 @@ QUANT_MODES = [
     {"mode": "mxfp4",   "bits": 4, "group_size": 32,  "label": "MXFP4"},
     {"mode": "mxfp8",   "bits": 8, "group_size": 32,  "label": "MXFP8"},
 ]
+
+# M values used to compute summary scores
+PREFILL_M_VALUES = [128, 512, 1024]
+DECODE_M_VALUES  = [1]
 
 
 def flush_l2_cache():
@@ -85,7 +109,6 @@ def bench_quantized_matmul(M, K, N, mode_cfg, dtype=mx.float16):
     bits = mode_cfg["bits"]
     gs = mode_cfg["group_size"]
 
-    # Create random weight and quantize
     w_fp = mx.random.normal(shape=(N, K)).astype(dtype)
     mx.eval(w_fp)
 
@@ -160,9 +183,6 @@ def bench_gather_qmm(M, K, N, E, topk, mode_cfg, dtype=mx.float16):
     bits = mode_cfg["bits"]
     gs = mode_cfg["group_size"]
 
-    # Create E expert weights and quantize.
-    # Quantize as flat (E*N, K) then reshape to (E, N, ...) to avoid mx.stack
-    # which triggers JIT compilation that may fail on some systems.
     w_fp = mx.random.normal(shape=(E * N, K)).astype(dtype)
     mx.eval(w_fp)
 
@@ -181,13 +201,10 @@ def bench_gather_qmm(M, K, N, E, topk, mode_cfg, dtype=mx.float16):
         biases = None
         mx.eval(w_q, scales)
 
-    # Simulate MoE routing: B tokens, each selecting topk experts
     B = M  # tokens
     x = mx.random.normal(shape=(B, 1, K)).astype(dtype)
     mx.eval(x)
 
-    # lhs_indices: which token (identity for prefill)
-    # rhs_indices: which expert
     rhs_idx = mx.random.randint(0, E, shape=(B, topk)).astype(mx.uint32)
     lhs_idx = mx.broadcast_to(mx.arange(B).reshape(-1, 1), (B, topk)).astype(mx.uint32)
     mx.eval(rhs_idx, lhs_idx)
@@ -230,20 +247,20 @@ def print_header(title):
     print(f"{'='*80}")
 
 
-def run_qmm_benchmarks():
+def run_qmm_benchmarks(model_set=None):
     """Run QuantizedMatmul benchmarks across model sizes and quant modes."""
     print_header("QuantizedMatmul Benchmarks")
 
+    models = model_set or MODELS
     batch_sizes = [1, 4, 16, 32, 64, 256, 1024, 4096]
 
-    for model_name, dims in MODELS.items():
+    for model_name, dims in models.items():
         K, N = dims["K"], dims["N"]
         print(f"\n--- {model_name} (K={K}, N={N}) ---")
         print(f"{'Mode':<14} {'M':>5}  {'Time(ms)':>10}  {'TFLOP/s':>9}  {'GB/s':>8}  {'%DRAM':>6}  {'vs Dense':>9}")
         print("-" * 76)
 
         for M in batch_sizes:
-            # Dense reference
             dense_t, dense_tflops = bench_dense_matmul(M, K, N)
 
             for mcfg in QUANT_MODES:
@@ -266,14 +283,12 @@ def run_gather_qmm_benchmarks():
 
     K, N, E, topk = DSV3_K, DSV3_N, DSV3_E, DSV3_TOPK
 
-    # Only test modes that are realistic for MoE
     moe_modes = [
         {"mode": "affine", "bits": 4, "group_size": 64,  "label": "INT4-gs64"},
         {"mode": "affine", "bits": 4, "group_size": 128, "label": "INT4-gs128"},
         {"mode": "nvfp4",  "bits": 4, "group_size": 16,  "label": "NVFP4"},
     ]
 
-    # Test token counts typical for prefill
     token_counts = [1, 4, 8, 32, 128, 512, 1024, 2048]
 
     print(f"\nDeepSeek V3.1 MoE: E={E}, topk={topk}, K={K}, N={N}")
@@ -315,27 +330,100 @@ def run_sweep():
         time.sleep(COOLDOWN)
 
 
+def compute_scores():
+    """
+    Compute canonical prefill and decode scores across SCORE_MODELS.
+
+    Prefill score: mean TFLOP/s at M=128, 512, 1024 for each model × mode.
+    Decode score:  mean %DRAM at M=1 for each model × mode.
+
+    These are the primary optimization targets for the research loop.
+    A change must not regress either score by >5% to be a 'keep'.
+    """
+    print_header("Summary Scores (optimization targets)")
+
+    prefill_results = {}  # mode_label -> list of TFLOP/s
+    decode_results = {}   # mode_label -> list of %DRAM
+
+    for mcfg in QUANT_MODES:
+        label = mcfg["label"]
+        prefill_results[label] = []
+        decode_results[label] = []
+
+    for model_name, dims in SCORE_MODELS.items():
+        K, N = dims["K"], dims["N"]
+        print(f"\n  Scoring {model_name} (K={K}, N={N})...")
+
+        for mcfg in QUANT_MODES:
+            label = mcfg["label"]
+
+            # Prefill: M=128, 512, 1024
+            for M in PREFILL_M_VALUES:
+                try:
+                    t, tf, bw = bench_quantized_matmul(M, K, N, mcfg)
+                    prefill_results[label].append(tf)
+                    time.sleep(COOLDOWN)
+                except Exception:
+                    pass
+
+            # Decode: M=1
+            for M in DECODE_M_VALUES:
+                try:
+                    t, tf, bw = bench_quantized_matmul(M, K, N, mcfg)
+                    pct = bw / DRAM_BW_GBS * 100
+                    decode_results[label].append(pct)
+                    time.sleep(COOLDOWN)
+                except Exception:
+                    pass
+
+    print_header("Score Summary")
+    print(f"\n{'Mode':<14}  {'Prefill Score':>14}  {'Decode Score':>13}")
+    print(f"{'':14}  {'(mean TFLOP/s)':>14}  {'(mean %DRAM)':>13}")
+    print("-" * 46)
+
+    scores = {}
+    for mcfg in QUANT_MODES:
+        label = mcfg["label"]
+        pr = prefill_results[label]
+        dr = decode_results[label]
+        prefill_score = sum(pr) / len(pr) if pr else 0.0
+        decode_score  = sum(dr) / len(dr) if dr else 0.0
+        scores[label] = {"prefill": prefill_score, "decode": decode_score}
+        print(f"{label:<14}  {prefill_score:>13.2f}T  {decode_score:>12.1f}%")
+
+    return scores
+
+
 def main():
     parser = argparse.ArgumentParser(description="MLX QMM Benchmark")
-    parser.add_argument("--qmm", action="store_true", help="Run QuantizedMatmul benchmarks")
+    parser.add_argument("--qmm",    action="store_true", help="Run QuantizedMatmul benchmarks (all model shapes)")
     parser.add_argument("--gather", action="store_true", help="Run GatherQMM benchmarks")
-    parser.add_argument("--sweep", action="store_true", help="Run batch size sweep")
+    parser.add_argument("--sweep",  action="store_true", help="Run batch size sweep")
+    parser.add_argument("--scores", action="store_true", help="Compute prefill/decode summary scores only")
+    parser.add_argument("--ffn",    action="store_true", help="Include FFN shapes in --qmm run")
     args = parser.parse_args()
 
-    # Print system info
     print(f"MLX version: {mx.__version__}")
     print(f"Default device: {mx.default_device()}")
     print(f"Methodology: median of {TRIALS} trials x {ITERS_PER_TRIAL} iters, {WARMUP} warmup")
 
-    # If no flags, run everything
-    run_all = not (args.qmm or args.gather or args.sweep)
+    run_all = not (args.qmm or args.gather or args.sweep or args.scores)
+
+    if args.scores:
+        compute_scores()
+        return
+
+    model_set = MODELS if args.ffn else SCORE_MODELS
 
     if run_all or args.qmm:
-        run_qmm_benchmarks()
+        run_qmm_benchmarks(model_set=model_set if not args.ffn else MODELS)
     if run_all or args.gather:
         run_gather_qmm_benchmarks()
     if run_all or args.sweep:
         run_sweep()
+
+    if run_all:
+        compute_scores()
 
 
 if __name__ == "__main__":
