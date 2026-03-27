@@ -42,25 +42,33 @@ DSV3_TOPK = 8
 
 # Model configs: square attention/projection layers + FFN up/down layers
 # FFN shapes matter — they're asymmetric and hit different dispatch paths
+# DSv3/Qwen shapes included — these are real target models for the exo cluster
 MODELS = {
-    "Llama-7B":       {"K": 4096,  "N": 4096},   # attn proj / hidden
-    "Llama-7B-FFN-up":   {"K": 4096,  "N": 11008},  # gate/up
-    "Llama-7B-FFN-down": {"K": 11008, "N": 4096},   # down
-    "Llama-13B":      {"K": 5120,  "N": 5120},
-    "Llama-13B-FFN-up":  {"K": 5120,  "N": 13568},
-    "Llama-13B-FFN-down":{"K": 13568, "N": 5120},
-    "Llama-70B":      {"K": 8192,  "N": 8192},
-    "Llama-70B-FFN-up":  {"K": 8192,  "N": 28672},
-    "Llama-70B-FFN-down":{"K": 28672, "N": 8192},
-    "DSv3-MLP":       {"K": DSV3_K, "N": DSV3_N},
+    "Llama-7B":           {"K": 4096,  "N": 4096},   # attn proj / hidden
+    "Llama-7B-FFN-up":    {"K": 4096,  "N": 11008},  # gate/up
+    "Llama-7B-FFN-down":  {"K": 11008, "N": 4096},   # down
+    "Llama-13B":          {"K": 5120,  "N": 5120},
+    "Llama-13B-FFN-up":   {"K": 5120,  "N": 13568},
+    "Llama-13B-FFN-down": {"K": 13568, "N": 5120},
+    "Llama-70B":          {"K": 8192,  "N": 8192},
+    "Llama-70B-FFN-up":   {"K": 8192,  "N": 28672},
+    "Llama-70B-FFN-down": {"K": 28672, "N": 8192},
+    "DSv3-Attn":          {"K": 7168,  "N": 7168},   # DeepSeek V3 attention proj
+    "DSv3-MLP":           {"K": DSV3_K, "N": DSV3_N},
+    "Qwen3-5-14B":        {"K": 5120,  "N": 5120},   # Qwen3.5 hidden (same as 13B)
+    "Qwen3-5-72B":        {"K": 8192,  "N": 8192},   # Qwen3.5-72B hidden (same as 70B)
+    "Qwen3-5-14B-FFN-up": {"K": 5120,  "N": 13824},  # Qwen3.5-14B FFN gate/up
+    "Qwen3-5-14B-FFN-down":{"K": 13824, "N": 5120},  # Qwen3.5-14B FFN down
 }
 
 # Canonical models for prefill/decode scoring (skip FFN variants to keep it fast)
+# These are the models used in the research loop's keep/discard decision
 SCORE_MODELS = {
-    "Llama-7B":  {"K": 4096,  "N": 4096},
-    "Llama-13B": {"K": 5120,  "N": 5120},
-    "Llama-70B": {"K": 8192,  "N": 8192},
-    "DSv3-MLP":  {"K": DSV3_K, "N": DSV3_N},
+    "Llama-7B":   {"K": 4096,  "N": 4096},
+    "Llama-13B":  {"K": 5120,  "N": 5120},
+    "Llama-70B":  {"K": 8192,  "N": 8192},
+    "DSv3-Attn":  {"K": 7168,  "N": 7168},
+    "DSv3-MLP":   {"K": DSV3_K, "N": DSV3_N},
 }
 
 QUANT_MODES = [
