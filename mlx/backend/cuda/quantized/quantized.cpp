@@ -302,7 +302,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   // Falls through to host-sync dequant+cuBLAS for affine or non-128-aligned K.
   if (d.compute_capability_major() >= 12 && transpose_ &&
       mode_ != QuantizationMode::Affine && (K % 128 == 0)) {
-    gather_qmm_sm120_gpu(
+    gather_qmm_grouped_gpu(
         x, w, scales,
         lhs_indices, rhs_indices,
         out, group_size_, bits_, mode_,
