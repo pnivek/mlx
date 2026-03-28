@@ -709,11 +709,11 @@ void execute_grouped_fp4_gemm(
 
   CHECK_CUDA_ERROR(cudaLaunchKernelEx(
       &cfg, args_kernel,
-      reinterpret_cast<ElementA*>(xq_buf.data<void>()),
-      reinterpret_cast<ElementB*>(w_for_gemm.data<void>()),
+      reinterpret_cast<ElementA*>(const_cast<void*>(xq_buf.data<void>())),
+      reinterpret_cast<ElementB*>(const_cast<void*>(w_for_gemm.data<void>())),
       sfa_base,
       reinterpret_cast<SFType*>(const_cast<void*>(grouped_sfb)),
-      reinterpret_cast<ElementD*>(out_sorted.data<void>()),
+      reinterpret_cast<ElementD*>(const_cast<void*>(out_sorted.data<void>())),
       d_m_indptr, N_padded, K, E, sfb_per_expert,
       d_prob, d_Aptr, d_Bptr, d_SFAptr, d_SFBptr, d_Dptr,
       d_strA, d_strB, d_strD, d_layA, d_layB));
