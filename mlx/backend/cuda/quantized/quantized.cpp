@@ -297,6 +297,18 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   // Ensure cuBLAS handle exists before synchronize — creating it after
   // synchronize can fail with CUBLAS_STATUS_ALLOC_FAILED on SM121/CUDA 13.0.
+  // E003: SM120 native GEMM path for FP modes (no dequant needed).
+  // Uses on-device counting sort + per-expert SM120 native GEMM.
+  // Falls through to host-sync dequant+cuBLAS for affine or non-128-aligned K.
+  if (d.compute_capability_major() >= 12 && transpose_ &&
+      mode_ != QuantizationMode::Affine && (K % 128 == 0)) {
+    gather_qmm_sm120_gpu(
+        x, w, scales,
+        lhs_indices, rhs_indices,
+        out, group_size_, bits_, mode_,
+        enc, s);
+    return;
+  }
   d.get_cublaslt_handle();
 
   // Host-side grouping path: sync to read indices, per-expert dequant + cuBLAS.

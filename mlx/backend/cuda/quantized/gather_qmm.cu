@@ -8,6 +8,7 @@
 //    dequant + cuBLAS GEMM loop.
 
 #include "mlx/backend/cuda/quantized/gather_qmm.h"
+#include "mlx/backend/cuda/quantized/qmm_sm120.h"
 #include "mlx/backend/cuda/quantized/quantized.h"
 #include "mlx/backend/cuda/quantized/quantized_utils.h"
 #include "mlx/backend/cuda/gemms/cublas_gemm.h"
@@ -504,3 +505,175 @@ void gather_qmm_gpu(
 }
 
 } // namespace mlx::core
+
+// ============================================================================
+// E003: Device-side sorted path with SM120 native GEMM (no dequant)
+// ============================================================================
+
+void gather_qmm_sm120_gpu(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& lhs_indices,
+    const array& rhs_indices,
+    array& out,
+    int group_size,
+    int bits,
+    QuantizationMode mode,
+    cu::CommandEncoder& enc,
+    const Stream& s) {
+  int M = x.shape(-2);
+  int K = x.shape(-1);
+  int N = out.shape(-1);
+  int B = lhs_indices.size();
+  int E = w.shape(0);
+
+  if (B == 0)
+    return;
+
+  // Phase 1: On-device counting sort by expert.
+  array lhs_flat = ensure_row_contiguous(lhs_indices, enc, s);
+  array rhs_flat = ensure_row_contiguous(rhs_indices, enc, s);
+
+  enc.commit();
+  enc.begin_direct_launch();
+
+  auto sorted = sort_gather_indices(lhs_flat, rhs_flat, B, E, enc, s);
+
+  // Phase 2: Gather activations in sorted order.
+  int x_elem_size = size_of(x.dtype());
+  array x_gathered({B * M, K}, x.dtype(), nullptr, {});
+  x_gathered.set_data(cu::malloc_async(
+      static_cast<size_t>(B) * M * K * x_elem_size, enc));
+  enc.add_temporary(x_gathered);
+
+  enc.set_input_array(x);
+  enc.set_input_array(sorted.sorted_lhs);
+  enc.set_output_array(x_gathered);
+  if (x_elem_size == 2) {
+    enc.add_kernel_node(
+        gather_rows_kernel<__half>,
+        dim3(B), dim3(256),
+        gpu_ptr<__half>(x), gpu_ptr<__half>(x_gathered),
+        gpu_ptr<uint32_t>(sorted.sorted_lhs),
+        B, M, K);
+  } else {
+    enc.add_kernel_node(
+        gather_rows_kernel<float>,
+        dim3(B), dim3(256),
+        gpu_ptr<float>(x), gpu_ptr<float>(x_gathered),
+        gpu_ptr<uint32_t>(sorted.sorted_lhs),
+        B, M, K);
+  }
+
+  // Phase 3: Read expert offsets from device (small sync: E*4 bytes).
+  // We need to know how many items each expert has to launch per-expert GEMMs.
+  // The sort_gather_indices function computes this on device, but we need
+  // the offsets on host. This is much smaller than copying all B indices.
+
+  // Re-compute expert counts on device and copy to host.
+  // TODO: expose expert_offsets from sort_gather_indices to avoid recomputation.
+  array d_counts_buf({E}, uint32, nullptr, {});
+  d_counts_buf.set_data(cu::malloc_async(E * sizeof(uint32_t), enc));
+  enc.add_temporary(d_counts_buf);
+
+  uint32_t* d_counts = gpu_ptr<uint32_t>(d_counts_buf);
+
+  // Zero counts
+  enc.set_output_array(d_counts_buf);
+  enc.add_kernel_node(
+      zero_uint32_kernel,
+      dim3((E + 255) / 256), dim3(256),
+      d_counts, E);
+
+  // Count items per expert
+  enc.set_input_array(sorted.sorted_rhs);
+  enc.set_output_array(d_counts_buf);
+  enc.add_kernel_node(
+      count_experts_kernel,
+      dim3((B + 255) / 256), dim3(256),
+      gpu_ptr<uint32_t>(sorted.sorted_rhs), B, d_counts);
+
+  // Sync to read counts on host (E*4 bytes — typically 1KB for E=256)
+  enc.synchronize();
+
+  std::vector<uint32_t> expert_counts(E);
+  CHECK_CUDA_ERROR(cudaMemcpy(
+      expert_counts.data(), d_counts, E * sizeof(uint32_t),
+      cudaMemcpyDefault));
+
+  // Phase 4: Per-expert SM120 native GEMM (no dequant!).
+  // Process activations in sorted order, one expert at a time.
+  int out_elem_size = size_of(out.dtype());
+  array out_sorted({B * M, N}, out.dtype(), nullptr, {});
+  out_sorted.set_data(cu::malloc_async(
+      static_cast<size_t>(B) * M * N * out_elem_size, enc));
+  enc.add_temporary(out_sorted);
+
+  size_t w_expert_stride = w.strides()[0];
+  size_t scales_expert_stride = scales.strides()[0];
+  int offset = 0;
+
+  for (int e = 0; e < E; e++) {
+    int count = static_cast<int>(expert_counts[e]);
+    if (count == 0)
+      continue;
+
+    int batch_m = count * M;
+
+    // Create expert weight/scale slices (no copy, shared buffer offset)
+    auto make_expert_slice =
+        [&](const array& arr, size_t expert_stride) -> array {
+      Shape slice_shape(arr.shape().begin() + 1, arr.shape().end());
+      Strides slice_strides(arr.strides().begin() + 1, arr.strides().end());
+      array slice(slice_shape, arr.dtype(), nullptr, {});
+      slice.copy_shared_buffer(
+          arr,
+          slice_strides,
+          arr.flags(),
+          arr.data_size(),
+          static_cast<int64_t>(e) *
+              static_cast<int64_t>(expert_stride));
+      return slice;
+    };
+
+    array w_expert = make_expert_slice(w, w_expert_stride);
+    array scales_expert = make_expert_slice(scales, scales_expert_stride);
+
+    // Create x slice for this expert group (from sorted x_gathered)
+    array x_expert({batch_m, K}, x.dtype(), nullptr, {});
+    x_expert.copy_shared_buffer(
+        x_gathered,
+        {static_cast<int64_t>(K), 1},
+        x_gathered.flags(),
+        x_gathered.data_size(),
+        static_cast<int64_t>(offset) * M * K);
+
+    // Create output slice
+    array out_expert({batch_m, N}, out.dtype(), nullptr, {});
+    out_expert.copy_shared_buffer(
+        out_sorted,
+        {static_cast<int64_t>(N), 1},
+        out_sorted.flags(),
+        out_sorted.data_size(),
+        static_cast<int64_t>(offset) * M * N);
+
+    // SM120 native GEMM — reads FP4 weights directly, no dequant!
+    if (mode == QuantizationMode::Mxfp8) {
+      cute_qmm_fp8_sm120(
+          x_expert, w_expert, scales_expert, out_expert,
+          group_size, enc);
+    } else {
+      cute_qmm_fp4_sm120(
+          x_expert, w_expert, scales_expert, out_expert,
+          bits, group_size, enc);
+    }
+
+    offset += count;
+  }
+
+  // Phase 5: Scatter output from sorted order back to original positions.
+  scatter_gather_output(out_sorted, sorted.sorted_perm, out, B, M, N, enc);
+
+  enc.end_direct_launch();
+}
