@@ -160,10 +160,10 @@ template <
     typename LayoutSFA,
     typename LayoutSFB>
 __global__ void grouped_gemm_setup_args(
-    ElementA* A,        // [B_total, K/2] quantized activations
-    ElementB* B,        // [E, N_padded, K/2] padded weights
-    SFType* SFA,        // grouped SFA buffer (pre-quantized, zero-init'd)
-    SFType* SFB,        // grouped SFB buffer [E, sfb_per_expert_elems]
+    const ElementA* A,        // [B_total, K/2] quantized activations
+    const ElementB* B,        // [E, N_padded, K/2] padded weights
+    const SFType* SFA,        // grouped SFA buffer (pre-quantized, zero-init'd)
+    const SFType* SFB,        // grouped SFB buffer [E, sfb_per_expert_elems]
     ElementD* D,        // [B_total, N_padded] output
     int* m_indptr,      // [E+1] token offsets per expert
     int N_padded,
@@ -709,8 +709,8 @@ void execute_grouped_fp4_gemm(
 
   CHECK_CUDA_ERROR(cudaLaunchKernelEx(
       &cfg, args_kernel,
-      reinterpret_cast<ElementA*>(const_cast<void*>(xq_buf.data<void>())),
-      reinterpret_cast<ElementB*>(const_cast<void*>(w_for_gemm.data<void>())),
+      reinterpret_cast<const ElementA*>(xq_buf.data<void>()),
+      reinterpret_cast<const ElementB*>(w_for_gemm.data<void>()),
       sfa_base,
       reinterpret_cast<SFType*>(const_cast<void*>(grouped_sfb)),
       reinterpret_cast<ElementD*>(const_cast<void*>(out_sorted.data<void>())),
