@@ -52,11 +52,8 @@ void gather_qmm_gpu(
     cu::CommandEncoder& enc,
     const Stream& s);
 
-} // namespace mlx::core
 
-// Device-side sorted path with SM120 native FP4/FP8 GEMM.
-// Uses on-device counting sort + per-expert native GEMM (no dequant).
-// Only for FP modes (MXFP4/NVFP4/MXFP8) where K%128==0.
+// E003: Device-side sorted path with SM120 native FP4/FP8 GEMM.
 void gather_qmm_sm120_gpu(
     const array& x,
     const array& w,
@@ -69,3 +66,5 @@ void gather_qmm_sm120_gpu(
     QuantizationMode mode,
     cu::CommandEncoder& enc,
     const Stream& s);
+
+} // namespace mlx::core

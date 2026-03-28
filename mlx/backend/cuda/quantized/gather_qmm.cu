@@ -504,7 +504,6 @@ void gather_qmm_gpu(
   enc.end_direct_launch();
 }
 
-} // namespace mlx::core
 
 // ============================================================================
 // E003: Device-side sorted path with SM120 native GEMM (no dequant)
@@ -677,3 +676,6 @@ void gather_qmm_sm120_gpu(
 
   enc.end_direct_launch();
 }
+
+} // namespace mlx::core
+
