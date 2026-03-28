@@ -52,4 +52,33 @@ void gather_qmm_gpu(
     cu::CommandEncoder& enc,
     const Stream& s);
 
+
+// E003: Device-side sorted path with SM120 native FP4/FP8 GEMM.
+void gather_qmm_sm120_gpu(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& lhs_indices,
+    const array& rhs_indices,
+    array& out,
+    int group_size,
+    int bits,
+    QuantizationMode mode,
+    cu::CommandEncoder& enc,
+    const Stream& s);
+
+// E003-grouped: Single CUTLASS grouped GEMM launch for all experts at once.
+void gather_qmm_grouped_gpu(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& lhs_indices,
+    const array& rhs_indices,
+    array& out,
+    int group_size,
+    int bits,
+    QuantizationMode mode,
+    cu::CommandEncoder& enc,
+    const Stream& s);
+
 } // namespace mlx::core
