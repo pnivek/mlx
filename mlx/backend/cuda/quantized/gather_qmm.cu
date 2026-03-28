@@ -21,6 +21,11 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+// GDC (Grid Dependency Control) for SM120+ dependent kernel launches
+#if (__CUDACC_VER_MAJOR__ >= 12)
+#include <cutlass/arch/grid_dependency_control.h>
+#endif
+
 #include <unordered_map>
 #include <vector>
 
@@ -593,13 +598,19 @@ void gather_qmm_sm120_gpu(
       dim3((B + 255) / 256), dim3(256),
       gpu_ptr<uint32_t>(sorted.sorted_rhs), B, d_counts);
 
-  // Sync to read counts on host (E*4 bytes — typically 1KB for E=256)
-  enc.synchronize();
+  // Read expert counts from device to host.
+  // Use pinned memory + cudaMemcpyAsync for minimal sync overhead.
+  // The counts are tiny (E*4 bytes ≈ 1KB) so the copy is near-instant.
+  uint32_t* h_counts = nullptr;
+  CHECK_CUDA_ERROR(cudaHostAlloc(&h_counts, E * sizeof(uint32_t), cudaHostAllocDefault));
+  CHECK_CUDA_ERROR(cudaMemcpyAsync(
+      h_counts, d_counts, E * sizeof(uint32_t),
+      cudaMemcpyDeviceToHost, enc.stream()));
+  // Sync only after the async copy completes (GPU was doing useful work above)
+  CHECK_CUDA_ERROR(cudaStreamSynchronize(enc.stream()));
 
-  std::vector<uint32_t> expert_counts(E);
-  CHECK_CUDA_ERROR(cudaMemcpy(
-      expert_counts.data(), d_counts, E * sizeof(uint32_t),
-      cudaMemcpyDefault));
+  std::vector<uint32_t> expert_counts(h_counts, h_counts + E);
+  CHECK_CUDA_ERROR(cudaFreeHost(h_counts));
 
   // Phase 4: Per-expert SM120 native GEMM (no dequant!).
   // Process activations in sorted order, one expert at a time.
