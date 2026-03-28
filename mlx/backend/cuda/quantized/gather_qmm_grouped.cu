@@ -107,6 +107,26 @@ __global__ void scatter_rows_truncated(
 }
 
 // ============================================================================
+// Device+host helper: construct a packed CUTLASS stride from logical dims.
+// Mirrors qmm_sm120.cu's make_packed_stride but with __host__ __device__ so
+// it can be called inside __global__ kernels.
+// ============================================================================
+template <typename Stride>
+__host__ __device__ __forceinline__ Stride make_grouped_packed_stride(int dim0, int dim1) {
+  Stride stride{};
+  using Elem0 = cute::tuple_element_t<0, Stride>;
+  if constexpr (cute::is_static_v<Elem0>) {
+    // ColumnMajor-like: first element is Int<1>, set second = dim0 (rows).
+    cute::get<1>(stride) = dim0;
+  } else {
+    // RowMajor-like: second element is Int<1>, set first = dim1 (cols).
+    cute::get<0>(stride) = dim1;
+  }
+  // Batch stride (index 2) stays 0 for non-batched.
+  return stride;
+}
+
+// ============================================================================
 // Device helper: safe pointer offset for sub-byte types.
 // ============================================================================
 template <typename T>
@@ -188,9 +208,9 @@ __global__ void grouped_gemm_setup_args(
 
   problem_sizes[i] = ProblemShape(m_cnt, N_padded, K);
 
-  stride_A[i] = cutlass::make_cute_packed_stride(StrideA{}, {m_cnt, K, 1});
-  stride_B[i] = cutlass::make_cute_packed_stride(StrideB{}, {N_padded, K, 1});
-  stride_D[i] = cutlass::make_cute_packed_stride(StrideD{}, {m_cnt, N_padded, 1});
+  stride_A[i] = make_grouped_packed_stride<StrideA>(m_cnt, K);
+  stride_B[i] = make_grouped_packed_stride<StrideB>(N_padded, K);
+  stride_D[i] = make_grouped_packed_stride<StrideD>(m_cnt, N_padded);
 
   A_ptr[i] = safe_ptr_off(A, static_cast<size_t>(m_off) * static_cast<size_t>(K));
   B_ptr[i] = safe_ptr_off(
