@@ -852,10 +852,11 @@ void gather_qmm_grouped_gpu(
       h_counts, d_cnts, E * sizeof(uint32_t), cudaMemcpyDeviceToHost, enc.stream()));
   CHECK_CUDA_ERROR(cudaStreamSynchronize(enc.stream()));
 
+  // Indptr is in row units (not gather-op units): each gather op contributes M rows.
   std::vector<int> host_m_indptr(E + 1);
   host_m_indptr[0] = 0;
   for (int e = 0; e < E; e++)
-    host_m_indptr[e + 1] = host_m_indptr[e] + static_cast<int>(h_counts[e]);
+    host_m_indptr[e + 1] = host_m_indptr[e] + static_cast<int>(h_counts[e]) * M;
   CHECK_CUDA_ERROR(cudaFreeHost(h_counts));
 
   CHECK_CUDA_ERROR(cudaMemcpyAsync(
