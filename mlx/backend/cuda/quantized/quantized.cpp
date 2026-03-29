@@ -261,12 +261,12 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   // Reads quantized weights directly — no dequant buffer needed.
   // For large B (prefill), the host-sync dequant+GEMM path is faster
   // because it reads each expert's weights only once.
-  if (transpose_ && M <= 16 && B <= 512 && mode_ != QuantizationMode::Affine) {
+  if (transpose_ && M <= 16 && B <= 2048 && mode_ != QuantizationMode::Affine) {
     // Make indices contiguous (MoE produces broadcast/strided 3D indices).
     array lhs_flat = ensure_row_contiguous(lhs_indices, enc, s);
     array rhs_flat = ensure_row_contiguous(rhs_indices, enc, s);
 
-    if (B <= 256) {
+    if (B <= 512) {
       // Small B: direct QMV, no sort needed.
       cu::fp_gather_qmv(
           w, scales, x, lhs_flat, rhs_flat, out,
