@@ -209,6 +209,81 @@ struct SFBCacheEntry {
 
 static std::unordered_map<SFBCacheKey, SFBCacheEntry, SFBCacheKeyHash> sfb_cache;
 static std::mutex sfb_cache_mutex;
+// ============================================================================
+// N-padding cache: cache padded weight and scale buffers for non-128-aligned N.
+// Same principle as SFB cache — weights are persistent, pad once and reuse.
+// Key: (weight_ptr, N, K) — uniquely identifies a weight that needs padding.
+// ============================================================================
+struct NpadCacheKey {
+  const void* ptr;
+  int N, K;
+  bool operator==(const NpadCacheKey& o) const {
+    return ptr == o.ptr && N == o.N && K == o.K;
+  }
+};
+
+struct NpadCacheKeyHash {
+  size_t operator()(const NpadCacheKey& k) const {
+    size_t h = std::hash<const void*>{}(k.ptr);
+    h ^= std::hash<int>{}(k.N) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    h ^= std::hash<int>{}(k.K) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    return h;
+  }
+};
+
+struct NpadCacheEntry {
+  void* device_ptr;
+  size_t bytes;
+};
+
+static std::unordered_map<NpadCacheKey, NpadCacheEntry, NpadCacheKeyHash> npad_cache;
+static std::mutex npad_cache_mutex;
+
+// Get or create a zero-padded copy of a (N, cols) buffer padded to (N_padded, cols).
+static void* get_or_pad_buffer(
+    const void* src,
+    int N,
+    int N_padded,
+    int cols,
+    size_t elem_size,
+    cudaStream_t stream) {
+  NpadCacheKey key{src, N, cols};
+
+  {
+    std::lock_guard<std::mutex> lock(npad_cache_mutex);
+    auto it = npad_cache.find(key);
+    if (it != npad_cache.end()) {
+      return it->second.device_ptr;
+    }
+  }
+
+  // Cache miss — allocate, zero, copy.
+  size_t padded_bytes = static_cast<size_t>(N_padded) * cols * elem_size;
+  size_t src_bytes = static_cast<size_t>(N) * cols * elem_size;
+  void* padded_ptr = nullptr;
+  cudaError_t err = cudaMalloc(&padded_ptr, padded_bytes);
+  if (err != cudaSuccess) {
+    throw std::runtime_error("[qmm_sm120] cudaMalloc failed for N-pad cache");
+  }
+
+  cudaMemsetAsync(padded_ptr, 0, padded_bytes, stream);
+  cudaMemcpyAsync(padded_ptr, src, src_bytes, cudaMemcpyDeviceToDevice, stream);
+  cudaStreamSynchronize(stream);
+
+  {
+    std::lock_guard<std::mutex> lock(npad_cache_mutex);
+    auto it = npad_cache.find(key);
+    if (it != npad_cache.end()) {
+      cudaFree(padded_ptr);
+      return it->second.device_ptr;
+    }
+    npad_cache[key] = {padded_ptr, padded_bytes};
+  }
+
+  return padded_ptr;
+}
+
+
 
 // ============================================================================
 // Scale factor reformatting kernel.
@@ -1389,24 +1464,31 @@ void cute_qmm_fp4_sm120(
     auto& stream = encoder.stream();
     size_t elem_size = size_of(out.dtype());
 
-    // Padded weight buffer: (N_padded, K/2) — first N rows from w, rest zero.
+    // Padded weight buffer: (N_padded, K/2) — cached, pad once and reuse.
     int w_cols = w.shape(-1);
+    size_t w_elem_size = size_of(w.dtype());
+    void* w_pad_ptr = get_or_pad_buffer(
+        w.data<void>(), N, N_padded, w_cols, w_elem_size, stream);
     array w_pad({N_padded, w_cols}, w.dtype(), nullptr, {});
     w_pad.set_data(cu::malloc_async(w_pad.nbytes(), encoder));
     encoder.add_temporary(w_pad);
-    cudaMemsetAsync(w_pad.data<void>(), 0, w_pad.nbytes(), stream);
+    // Fast copy from cache (single contiguous memcpy, NOT memset+memcpy)
     cudaMemcpyAsync(
-        w_pad.data<void>(), w.data<void>(), w.nbytes(),
+        w_pad.data<void>(), w_pad_ptr,
+        static_cast<size_t>(N_padded) * w_cols * w_elem_size,
         cudaMemcpyDeviceToDevice, stream);
 
-    // Padded scale buffer: (N_padded, K/gs) — first N rows from scales, rest zero.
+    // Padded scale buffer: (N_padded, K/gs) — cached.
     int s_cols = scales.shape(-1);
+    size_t s_elem_size = size_of(scales.dtype());
+    void* s_pad_ptr = get_or_pad_buffer(
+        scales.data<void>(), N, N_padded, s_cols, s_elem_size, stream);
     array s_pad({N_padded, s_cols}, scales.dtype(), nullptr, {});
     s_pad.set_data(cu::malloc_async(s_pad.nbytes(), encoder));
     encoder.add_temporary(s_pad);
-    cudaMemsetAsync(s_pad.data<void>(), 0, s_pad.nbytes(), stream);
     cudaMemcpyAsync(
-        s_pad.data<void>(), scales.data<void>(), scales.nbytes(),
+        s_pad.data<void>(), s_pad_ptr,
+        static_cast<size_t>(N_padded) * s_cols * s_elem_size,
         cudaMemcpyDeviceToDevice, stream);
 
     // Padded output: (M, N_padded).
@@ -1535,11 +1617,20 @@ void cute_qmm_fp8_sm120(
 }
 
 void clear_sm120_sf_cache() {
-  std::lock_guard<std::mutex> lock(sfb_cache_mutex);
-  for (auto& [key, entry] : sfb_cache) {
-    cudaFree(entry.device_ptr);
+  {
+    std::lock_guard<std::mutex> lock(sfb_cache_mutex);
+    for (auto& [key, entry] : sfb_cache) {
+      cudaFree(entry.device_ptr);
+    }
+    sfb_cache.clear();
   }
-  sfb_cache.clear();
+  {
+    std::lock_guard<std::mutex> lock(npad_cache_mutex);
+    for (auto& [key, entry] : npad_cache) {
+      cudaFree(entry.device_ptr);
+    }
+    npad_cache.clear();
+  }
 }
 
 } // namespace mlx::core
