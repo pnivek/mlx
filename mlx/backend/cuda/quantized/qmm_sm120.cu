@@ -312,6 +312,43 @@ static void* get_or_reformat_sfb(
 }
 
 // ============================================================================
+// Output column extraction kernel (replaces cudaMemcpy2DAsync for N-unpadding).
+// Each thread block handles one row, copying N_valid columns from N_padded stride.
+// Much faster than cudaMemcpy2DAsync on SM121 for strided copies.
+// ============================================================================
+template <typename T>
+__global__ void extract_columns_kernel(
+    const T* __restrict__ src,  // (M, N_padded)
+    T* __restrict__ dst,        // (M, N_valid)
+    int M,
+    int N_valid,
+    int N_padded) {
+  int row = blockIdx.x;
+  if (row >= M) return;
+  const T* src_row = src + static_cast<size_t>(row) * N_padded;
+  T* dst_row = dst + static_cast<size_t>(row) * N_valid;
+
+  // Vectorized copy: use uint4 (16 bytes) when aligned
+  constexpr int VEC_ELEMS = 16 / sizeof(T);
+  bool aligned = (reinterpret_cast<uintptr_t>(src_row) % 16 == 0) &&
+                 (reinterpret_cast<uintptr_t>(dst_row) % 16 == 0) &&
+                 (N_valid % VEC_ELEMS == 0);
+
+  if (aligned) {
+    int vec_count = N_valid / VEC_ELEMS;
+    auto* sv = reinterpret_cast<const uint4*>(src_row);
+    auto* dv = reinterpret_cast<uint4*>(dst_row);
+    for (int i = threadIdx.x; i < vec_count; i += blockDim.x) {
+      dv[i] = sv[i];
+    }
+  } else {
+    for (int i = threadIdx.x; i < N_valid; i += blockDim.x) {
+      dst_row[i] = src_row[i];
+    }
+  }
+}
+
+// ============================================================================
 // Activation quantization kernels (warp-cooperative).
 //
 // Quantizes fp16/bf16 activations to FP4 (e2m1) or FP8 (e4m3) with per-block
@@ -1381,15 +1418,21 @@ void cute_qmm_fp4_sm120(
     dispatch_sm120_fp4(x, w_pad, s_pad, out_pad, group_size, encoder);
 
     // Extract first N columns from each row of padded output.
-    cudaMemcpy2DAsync(
-        out.data<void>(),           // dst
-        N * elem_size,              // dst pitch (row stride in bytes)
-        out_pad.data<void>(),       // src
-        N_padded * elem_size,       // src pitch
-        N * elem_size,              // width to copy per row
-        M,                          // number of rows
-        cudaMemcpyDeviceToDevice,
-        stream);
+    // Uses a custom kernel instead of cudaMemcpy2DAsync — much faster on SM121.
+    {
+      int threads = std::min(N, 256);
+      if (elem_size == 2) {
+        extract_columns_kernel<__half><<<M, threads, 0, stream>>>(
+            reinterpret_cast<const __half*>(out_pad.data<void>()),
+            reinterpret_cast<__half*>(out.data<void>()),
+            M, N, N_padded);
+      } else {
+        extract_columns_kernel<float><<<M, threads, 0, stream>>>(
+            reinterpret_cast<const float*>(out_pad.data<void>()),
+            reinterpret_cast<float*>(out.data<void>()),
+            M, N, N_padded);
+      }
+    }
     return;
   }
 
