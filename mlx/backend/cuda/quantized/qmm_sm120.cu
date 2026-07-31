@@ -1408,38 +1408,61 @@ void cute_qmm_fp4_sm120(
   encoder.set_input_array(scales);
   encoder.set_output_array(out);
 
-  // The mainloop predicates partial N tiles natively, so weights and scales
-  // are used at their true N — no padded copies. Only the output TMA needs a
-  // 16-byte-aligned row stride: when N misses that (e.g. DSv3 N=1407), run
-  // the GEMM into a stride-padded buffer and extract the valid columns.
+  // The mainloop predicates partial N tiles natively, so any N that meets
+  // the output TMA's 16-byte contiguous-extent requirement (N % 8 for
+  // fp16/bf16) runs at the true N with no padding at all. There is no
+  // non-TMA epilogue for SM120 block-scaled configs, so N below that
+  // alignment (e.g. DSv3 N=1407) pads minimally to the next multiple of 8:
+  // copy weights/scales with a zeroed tail of <8 rows, then extract.
   int align_d = 16 / size_of(out.dtype());
-  int ldD = (N + align_d - 1) / align_d * align_d;
-
-  if (ldD == N) {
+  if (N % align_d == 0) {
     dispatch_sm120_fp4(x, w, scales, out, group_size, N, encoder);
     return;
   }
+  int N8 = (N + align_d - 1) / align_d * align_d;
 
   auto& stream = encoder.stream();
-  array out_pad({M, ldD}, out.dtype(), nullptr, {});
+  size_t w_row = static_cast<size_t>(w.shape(-1)) * w.itemsize();
+  array w_pad({N8, w.shape(-1)}, w.dtype(), nullptr, {});
+  w_pad.set_data(cu::malloc_async(w_pad.nbytes(), encoder));
+  encoder.add_temporary(w_pad);
+  cudaMemcpyAsync(
+      w_pad.data<void>(), w.data<void>(), w.nbytes(),
+      cudaMemcpyDeviceToDevice, stream);
+  cudaMemsetAsync(
+      static_cast<char*>(w_pad.data<void>()) + N * w_row,
+      0, (N8 - N) * w_row, stream);
+
+  size_t s_row = static_cast<size_t>(scales.shape(-1)) * scales.itemsize();
+  array s_pad({N8, scales.shape(-1)}, scales.dtype(), nullptr, {});
+  s_pad.set_data(cu::malloc_async(s_pad.nbytes(), encoder));
+  encoder.add_temporary(s_pad);
+  cudaMemcpyAsync(
+      s_pad.data<void>(), scales.data<void>(), scales.nbytes(),
+      cudaMemcpyDeviceToDevice, stream);
+  cudaMemsetAsync(
+      static_cast<char*>(s_pad.data<void>()) + N * s_row,
+      0, (N8 - N) * s_row, stream);
+
+  array out_pad({M, N8}, out.dtype(), nullptr, {});
   out_pad.set_data(cu::malloc_async(out_pad.nbytes(), encoder));
   encoder.add_temporary(out_pad);
 
-  dispatch_sm120_fp4(x, w, scales, out_pad, group_size, ldD, encoder);
+  dispatch_sm120_fp4(x, w_pad, s_pad, out_pad, group_size, N8, encoder);
 
-  // Extract first N columns from each row of the stride-padded output.
+  // Extract first N columns from each row of the padded output.
   {
     int threads = std::min(N, 256);
     if (size_of(out.dtype()) == 2) {
       extract_columns_kernel<__half><<<M, threads, 0, stream>>>(
           reinterpret_cast<const __half*>(out_pad.data<void>()),
           reinterpret_cast<__half*>(out.data<void>()),
-          M, N, ldD);
+          M, N, N8);
     } else {
       extract_columns_kernel<float><<<M, threads, 0, stream>>>(
           reinterpret_cast<const float*>(out_pad.data<void>()),
           reinterpret_cast<float*>(out.data<void>()),
-          M, N, ldD);
+          M, N, N8);
     }
   }
 }
@@ -1495,22 +1518,43 @@ void cute_qmm_fp8_sm120(
   encoder.set_input_array(scales);
   encoder.set_output_array(out);
 
-  // Same stride-padded output scheme as the FP4 wrapper: run at the true N,
-  // pad only the output row stride to 16-byte alignment when needed.
+  // Same scheme as the FP4 wrapper: true-N GEMM when N meets the output
+  // TMA alignment, minimal pad to the next multiple of 8 otherwise.
   int align_d = 16 / size_of(out.dtype());
-  int ldD = (N + align_d - 1) / align_d * align_d;
-
-  if (ldD == N) {
+  if (N % align_d == 0) {
     dispatch_sm120_fp8(x, w, scales, out, group_size, N, encoder);
     return;
   }
+  int N8 = (N + align_d - 1) / align_d * align_d;
 
   auto& stream = encoder.stream();
-  array out_pad({M, ldD}, out.dtype(), nullptr, {});
+  size_t w_row = static_cast<size_t>(w.shape(-1)) * w.itemsize();
+  array w_pad({N8, w.shape(-1)}, w.dtype(), nullptr, {});
+  w_pad.set_data(cu::malloc_async(w_pad.nbytes(), encoder));
+  encoder.add_temporary(w_pad);
+  cudaMemcpyAsync(
+      w_pad.data<void>(), w.data<void>(), w.nbytes(),
+      cudaMemcpyDeviceToDevice, stream);
+  cudaMemsetAsync(
+      static_cast<char*>(w_pad.data<void>()) + N * w_row,
+      0, (N8 - N) * w_row, stream);
+
+  size_t s_row = static_cast<size_t>(scales.shape(-1)) * scales.itemsize();
+  array s_pad({N8, scales.shape(-1)}, scales.dtype(), nullptr, {});
+  s_pad.set_data(cu::malloc_async(s_pad.nbytes(), encoder));
+  encoder.add_temporary(s_pad);
+  cudaMemcpyAsync(
+      s_pad.data<void>(), scales.data<void>(), scales.nbytes(),
+      cudaMemcpyDeviceToDevice, stream);
+  cudaMemsetAsync(
+      static_cast<char*>(s_pad.data<void>()) + N * s_row,
+      0, (N8 - N) * s_row, stream);
+
+  array out_pad({M, N8}, out.dtype(), nullptr, {});
   out_pad.set_data(cu::malloc_async(out_pad.nbytes(), encoder));
   encoder.add_temporary(out_pad);
 
-  dispatch_sm120_fp8(x, w, scales, out_pad, group_size, ldD, encoder);
+  dispatch_sm120_fp8(x, w_pad, s_pad, out_pad, group_size, N8, encoder);
 
   {
     int threads = std::min(N, 256);
@@ -1518,12 +1562,12 @@ void cute_qmm_fp8_sm120(
       extract_columns_kernel<__half><<<M, threads, 0, stream>>>(
           reinterpret_cast<const __half*>(out_pad.data<void>()),
           reinterpret_cast<__half*>(out.data<void>()),
-          M, N, ldD);
+          M, N, N8);
     } else {
       extract_columns_kernel<float><<<M, threads, 0, stream>>>(
           reinterpret_cast<const float*>(out_pad.data<void>()),
           reinterpret_cast<float*>(out.data<void>()),
-          M, N, ldD);
+          M, N, N8);
     }
   }
 }
