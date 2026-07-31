@@ -63,9 +63,23 @@ bool supports_qmm_sm120(
     }
     // NVFP4 with sub-alignment N: upstream's nvfp4 chain beats the
     // minimal-pad path at every M (MXFP4 odd-N stays ours: 2.3-5.4x wins).
-    if (mode == QuantizationMode::Nvfp4 &&
-        out.shape(-1) % (16 / out.itemsize()) != 0) {
+    int64_t n_out = out.shape(-1);
+    bool n_aligned = (n_out % (16 / out.itemsize())) == 0;
+    if (mode == QuantizationMode::Nvfp4 && !n_aligned) {
       return false;
+    }
+    // DSv4-class small shapes (2026-07 sweep): with 128-wide tiles, small N
+    // can't fill the GPU (N=576: 0.27-0.68x at every M) and small K never
+    // warms the TMA pipeline (K=1024: 0.62-0.89x); small weights only pay
+    // off at large M. Odd-N MXFP4 is exempt — stock handles it worse than
+    // our pad path at every size measured.
+    if (n_aligned) {
+      if (n_out < 1024 || x.shape(-1) < 2048) {
+        return false;
+      }
+      if (weight_elems < 16ll * 1024 * 1024 && m_total < 1024) {
+        return false;
+      }
     }
   }
   return true;
