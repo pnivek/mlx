@@ -67,8 +67,9 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized/affine_quantize.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized/fp_quantize.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized/qmm_sm120.cu
+          ${CMAKE_CURRENT_SOURCE_DIR}/quantized/qmm/cute_qmm.cu
+          ${CMAKE_CURRENT_SOURCE_DIR}/quantized/gather_qmm.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized/gather_qmm_grouped.cu
-          ${CMAKE_CURRENT_SOURCE_DIR}/quantized/gather_sort.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized/quantized.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized/qqmm.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized/qqmm_utils.cu

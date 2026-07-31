@@ -11,7 +11,7 @@
 // - PDL (Programmatic Dependent Launch) for zero-sync arg→GEMM chaining
 // - N-padding to next 128 multiple (required by CUTLASS TMA alignment)
 
-#include "mlx/backend/cuda/quantized/gather_qmm_sm120.h"
+#include "mlx/backend/cuda/quantized/gather_qmm.h"
 #include "mlx/backend/cuda/quantized/quantized.h"
 #include "mlx/backend/cuda/quantized/quantized_fp_utils.cuh"
 #include "mlx/backend/cuda/quantized/quantized_utils.h"

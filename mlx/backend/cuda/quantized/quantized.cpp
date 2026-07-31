@@ -2,7 +2,8 @@
 
 #include "mlx/backend/cuda/quantized/quantized.h"
 #include "mlx/backend/cuda/device.h"
-#include "mlx/backend/cuda/quantized/gather_qmm_sm120.h"
+#include "mlx/backend/cuda/quantized/gather_qmm.h"
+#include "mlx/backend/cuda/quantized/qmm/cute_qmm.h"
 #include "mlx/backend/cuda/quantized/qmm/qmm.h"
 #include "mlx/backend/cuda/quantized/qmm_sm120.h"
 #include "mlx/backend/cuda/quantized/quantized_utils.h"
@@ -16,7 +17,7 @@ namespace mlx::core {
 
 namespace {
 
-// SM120/SM121 (DGX Spark, GeForce Blackwell) native block-scaled GEMM.
+// SM120/SM121 (DGX Spark, Desktop Blackwell) native block-scaled GEMM.
 // Covers the FP quantization modes; K must be a multiple of the 128-wide
 // MMA tile. MXFP8 beyond M=2048 is faster through the regular chain.
 bool supports_qmm_sm120(
@@ -177,6 +178,23 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
 
+  // FP4 shapes that miss the K%128 SM120 constraint but satisfy the CuTe
+  // kernel's alignment (e.g. gpt-oss K=2880): CuTe tensor-core QMM.
+  if (encoder.device().compute_capability_major() >= 12 && transpose_ &&
+      bits_ == 4 &&
+      (mode_ == QuantizationMode::Mxfp4 ||
+       mode_ == QuantizationMode::Nvfp4) &&
+      w.ndim() == 2 && (N % 128 == 0) && (K % 64 == 0) &&
+      (x.dtype() == float16 || x.dtype() == bfloat16)) {
+    if (can_use_qmv && (M * B < 8)) {
+      call_qmv();
+    } else {
+      out.set_data(cu::malloc_async(out.nbytes(), encoder));
+      cute_qmm_fp4(x, w, scales, out, bits_, group_size_, encoder);
+    }
+    return;
+  }
+
   if (can_use_qmm_sm90) {
     if (can_use_qmv && (M == 1 && B == 1 && N <= 16384 && K <= 16384)) {
       call_qmv();
@@ -264,28 +282,43 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   bool can_use_qmm_naive = supports(supports_qmm_naive);
   bool can_use_qmv = supports(supports_qmv);
 
-  // SM120 grouped block-scaled GEMM: one CUTLASS grouped launch for all
-  // experts. FP4 modes only; worthwhile at prefill scale where each expert's
-  // weights are read once.
+  // SM120 (DGX Spark / Desktop Blackwell) MoE prefill paths for FP modes.
+  // At prefill scale each expert's weights are read once, so either a single
+  // CUTLASS grouped block-scaled GEMM (aligned FP4) or the host-sync
+  // per-expert dequant+cuBLAS loop beats the row-wise chain below.
   if (encoder.device().compute_capability_major() >= 12 && transpose_ &&
-      bits_ == 4 &&
-      (mode_ == QuantizationMode::Mxfp4 ||
-       mode_ == QuantizationMode::Nvfp4) &&
-      (K % 128 == 0) && (M * B > 2048) &&
+      mode_ != QuantizationMode::Affine && (M * B > 2048) &&
       (x.dtype() == float16 || x.dtype() == bfloat16)) {
     out.set_data(cu::malloc_async(out.nbytes(), encoder));
-    gather_qmm_grouped_gpu(
-        x,
-        w,
-        scales,
-        lhs_indices,
-        rhs_indices,
-        out,
-        group_size_,
-        bits_,
-        mode_,
-        encoder,
-        s);
+    if (bits_ == 4 && (K % 128 == 0)) {
+      gather_qmm_grouped_gpu(
+          x,
+          w,
+          scales,
+          lhs_indices,
+          rhs_indices,
+          out,
+          group_size_,
+          bits_,
+          mode_,
+          encoder,
+          s);
+    } else {
+      gather_qmm_gpu(
+          x,
+          w,
+          scales,
+          biases,
+          lhs_indices,
+          rhs_indices,
+          out,
+          transpose_,
+          group_size_,
+          bits_,
+          mode_,
+          encoder,
+          s);
+    }
     return;
   }
 

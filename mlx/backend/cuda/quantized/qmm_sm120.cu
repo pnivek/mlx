@@ -1,6 +1,6 @@
 // Copyright © 2026 Apple Inc.
 //
-// SM120 native block-scaled quantized GEMM for GeForce/DGX Spark (SM120/SM121).
+// SM120 native block-scaled quantized GEMM for Desktop Blackwell / DGX Spark (SM120/SM121).
 // Uses CUTLASS 3.x collective builder with OpClassBlockScaledTensorOp to
 // feed packed FP4/FP8 data directly to SM120 tensor cores with hardware
 // block scaling — eliminating the entire dequant-to-shared-memory pipeline.
@@ -108,7 +108,7 @@ struct Sm120BlockScaledGemm {
       128 / cutlass::sizeof_bits<ElementOut>::value;
   static constexpr int AlignD = AlignC;
 
-  // No multicast TMA on GeForce/SM121 — cluster must be 1×1×1.
+  // No multicast TMA on Desktop Blackwell/SM121 — cluster must be 1×1×1.
   using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
 
   // Epilogue: accumulator -> output conversion.
