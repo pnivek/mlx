@@ -347,17 +347,7 @@ cudaGraphNode_t CommandEncoder::add_kernel_node_raw(
     const cudaKernelNodeParams& params) {
   cudaGraphNode_t node;
   CHECK_CUDA_ERROR(cudaGraphAddKernelNode(&node, graph_, NULL, 0, &params));
-  // SM12x: cudaGraphExecUpdate silently corrupts execution when updating a
-  // cached exec with a different kernel function. Include func ptr in key
-  // to prevent cross-kernel cache reuse. On other GPUs, use topology-only
-  // keys for better cache hit rates.
-  std::string key;
-  if (device_.compute_capability_major() >= 12) {
-    key = fmt::format("K{:x}", reinterpret_cast<uintptr_t>(params.func));
-  } else {
-    key = "K";
-  }
-  insert_graph_dependencies(GraphNode{node, key});
+  insert_graph_dependencies(GraphNode{node, "K"});
   return node;
 }
 
@@ -365,13 +355,7 @@ CUgraphNode CommandEncoder::add_kernel_node_raw(
     const CUDA_KERNEL_NODE_PARAMS& params) {
   CUgraphNode node;
   CHECK_CUDA_ERROR(cuGraphAddKernelNode(&node, graph_, NULL, 0, &params));
-  std::string key;
-  if (device_.compute_capability_major() >= 12) {
-    key = fmt::format("K{:x}", reinterpret_cast<uintptr_t>(params.func));
-  } else {
-    key = "K";
-  }
-  insert_graph_dependencies(GraphNode{node, key});
+  insert_graph_dependencies(GraphNode{node, "K"});
   return node;
 }
 
