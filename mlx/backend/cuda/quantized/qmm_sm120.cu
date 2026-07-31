@@ -300,6 +300,10 @@ static void* get_or_reformat_sfb(
     throw std::runtime_error(
         "[qmm_sm120] cudaMalloc failed for SFB cache entry");
   }
+  // Zero-init: when N is not a tile multiple the layout's tail atoms are
+  // never written by the reformat kernel, but TMA still loads them. Garbage
+  // bytes there would feed the MMA scale path for predicated-off rows.
+  cudaMemsetAsync(sfb_ptr, 0, sfb_bytes, stream);
 
   constexpr int kThreads = 256;
   int wt_groups_per_row = K / group_size;
@@ -732,6 +736,7 @@ void run_sm120_gemm(
     int M,
     int N,
     int K,
+    int ldD, // output row stride in elements; == N when out is packed
     const void* a_ptr,
     const void* sfa_ptr,
     const void* b_ptr,
@@ -761,7 +766,9 @@ void run_sm120_gemm(
 
   StrideA stride_A = make_packed_stride<StrideA>(M, K);
   StrideB stride_B = make_packed_stride<StrideB>(N, K);
-  StrideD stride_D = make_packed_stride<StrideD>(M, N);
+  // The mainloop predicates partial N tiles; only the output TMA requires a
+  // 16-byte-aligned row stride, which may exceed the logical N extent.
+  StrideD stride_D = make_packed_stride<StrideD>(M, ldD);
 
   // Scale factor layouts computed from problem shape.
   LayoutSFA layout_SFA = BlkConfig::tile_atom_to_shape_SFA(problem_shape);
@@ -853,8 +860,9 @@ void execute_sm120_fp4_gemm(
     const array& x,      // (M, K) fp16/bf16 activation
     const array& w,      // (N, K/2) packed FP4 weights
     const array& scales, // (N, K/gs) fp16 weight scale factors
-    array& out,          // (M, N) output
+    array& out,          // (M, ldD) output; first N columns are valid
     int group_size,
+    int ldD,
     cu::CommandEncoder& encoder) {
   using BlkConfig = typename GemmType::Sm1xxBlkScaledConfig;
   using LayoutSFA = typename GemmType::LayoutSFA;
@@ -862,7 +870,7 @@ void execute_sm120_fp4_gemm(
   using SFType = typename ElementA::ScaleFactorType;
 
   int M = out.shape(-2);
-  int N = out.shape(-1);
+  int N = w.shape(-2);
   int K = x.shape(-1);
   int sf_vec_size = BlkConfig::SFVecSize;
   int num_act_groups = M * (K / sf_vec_size);
@@ -933,7 +941,7 @@ void execute_sm120_fp4_gemm(
   // which matches MLX's row-major (N, K/2) packed FP4 storage.
   run_sm120_gemm<GemmType>(
       kernel_ptr,
-      M, N, K,
+      M, N, K, ldD,
       x_q_buf.data<void>(),
       sfa_buf.data<void>(),
       w.data<void>(),
@@ -955,8 +963,9 @@ void execute_sm120_fp8_gemm(
     const array& x,      // (M, K) fp16/bf16 activation
     const array& w,      // (N, K) packed FP8 weights
     const array& scales, // (N, K/gs) weight scale factors
-    array& out,          // (M, N) output
+    array& out,          // (M, ldD) output; first N columns are valid
     int group_size,
+    int ldD,
     cu::CommandEncoder& encoder) {
   using BlkConfig = typename GemmType::Sm1xxBlkScaledConfig;
   using LayoutSFA = typename GemmType::LayoutSFA;
@@ -964,7 +973,7 @@ void execute_sm120_fp8_gemm(
   using SFType = typename ElementA::ScaleFactorType;
 
   int M = out.shape(-2);
-  int N = out.shape(-1);
+  int N = w.shape(-2);
   int K = x.shape(-1);
   int sf_vec_size = BlkConfig::SFVecSize;
   int num_act_groups = M * (K / sf_vec_size);
@@ -1025,7 +1034,7 @@ void execute_sm120_fp8_gemm(
   // FP8 weight data stored as (N, K) row-major — K contiguous, same as FP4.
   run_sm120_gemm<GemmType>(
       kernel_ptr,
-      M, N, K,
+      M, N, K, ldD,
       x_q_buf.data<void>(),
       sfa_buf.data<void>(),
       w.data<void>(),
@@ -1336,6 +1345,7 @@ static void dispatch_sm120_fp4(
     const array& scales,
     array& out,
     int group_size,
+    int ldD,
     cu::CommandEncoder& encoder) {
   const char* tag = "[qmm_fp4_sm120]";
 
@@ -1344,11 +1354,11 @@ static void dispatch_sm120_fp4(
     if (out.dtype() == bfloat16) {
       void* kernel_ptr = get_configured_kernel_nvfp4_bf16_pp();
       execute_sm120_fp4_gemm<NvFP4_BF16_Gemm_PP, __nv_bfloat16>(
-          kernel_ptr, x, w, scales, out, group_size, encoder);
+          kernel_ptr, x, w, scales, out, group_size, ldD, encoder);
     } else if (out.dtype() == float16) {
       void* kernel_ptr = get_configured_kernel_nvfp4_fp16_pp();
       execute_sm120_fp4_gemm<NvFP4_FP16_Gemm_PP, __half>(
-          kernel_ptr, x, w, scales, out, group_size, encoder);
+          kernel_ptr, x, w, scales, out, group_size, ldD, encoder);
     } else {
       throw std::runtime_error(
           fmt::format("{} Unsupported dtype for SM120 NVFP4 GEMM.", tag));
@@ -1358,11 +1368,11 @@ static void dispatch_sm120_fp4(
     if (out.dtype() == bfloat16) {
       void* kernel_ptr = get_configured_kernel_mxfp4_bf16_pp();
       execute_sm120_fp4_gemm<MxFP4_BF16_Gemm_PP, __nv_bfloat16>(
-          kernel_ptr, x, w, scales, out, group_size, encoder);
+          kernel_ptr, x, w, scales, out, group_size, ldD, encoder);
     } else if (out.dtype() == float16) {
       void* kernel_ptr = get_configured_kernel_mxfp4_fp16_pp();
       execute_sm120_fp4_gemm<MxFP4_FP16_Gemm_PP, __half>(
-          kernel_ptr, x, w, scales, out, group_size, encoder);
+          kernel_ptr, x, w, scales, out, group_size, ldD, encoder);
     } else {
       throw std::runtime_error(
           fmt::format("{} Unsupported dtype for SM120 MXFP4 GEMM.", tag));
@@ -1398,66 +1408,40 @@ void cute_qmm_fp4_sm120(
   encoder.set_input_array(scales);
   encoder.set_output_array(out);
 
-  // SM120 TMA requires N % 128 == 0 and K % 128 == 0.
-  // When N is not 128-aligned (e.g. DSv3 N=1407), pad weights, scales, and
-  // output to the next 128 multiple, run GEMM, then extract valid columns.
-  // Zero-padded weight rows produce zero GEMM contributions.
-  int N_padded = (N + 127) / 128 * 128;
-  bool needs_n_pad = (N_padded != N);
+  // The mainloop predicates partial N tiles natively, so weights and scales
+  // are used at their true N — no padded copies. Only the output TMA needs a
+  // 16-byte-aligned row stride: when N misses that (e.g. DSv3 N=1407), run
+  // the GEMM into a stride-padded buffer and extract the valid columns.
+  int align_d = 16 / size_of(out.dtype());
+  int ldD = (N + align_d - 1) / align_d * align_d;
 
-  if (needs_n_pad) {
-    auto& stream = encoder.stream();
-    size_t elem_size = size_of(out.dtype());
-
-    // Padded weight buffer: (N_padded, K/2) — first N rows from w, rest zero.
-    int w_cols = w.shape(-1);
-    array w_pad({N_padded, w_cols}, w.dtype(), nullptr, {});
-    w_pad.set_data(cu::malloc_async(w_pad.nbytes(), encoder));
-    encoder.add_temporary(w_pad);
-    cudaMemsetAsync(w_pad.data<void>(), 0, w_pad.nbytes(), stream);
-    cudaMemcpyAsync(
-        w_pad.data<void>(), w.data<void>(), w.nbytes(),
-        cudaMemcpyDeviceToDevice, stream);
-
-    // Padded scale buffer: (N_padded, K/gs) — first N rows from scales, rest zero.
-    int s_cols = scales.shape(-1);
-    array s_pad({N_padded, s_cols}, scales.dtype(), nullptr, {});
-    s_pad.set_data(cu::malloc_async(s_pad.nbytes(), encoder));
-    encoder.add_temporary(s_pad);
-    cudaMemsetAsync(s_pad.data<void>(), 0, s_pad.nbytes(), stream);
-    cudaMemcpyAsync(
-        s_pad.data<void>(), scales.data<void>(), scales.nbytes(),
-        cudaMemcpyDeviceToDevice, stream);
-
-    // Padded output: (M, N_padded).
-    array out_pad({M, N_padded}, out.dtype(), nullptr, {});
-    out_pad.set_data(cu::malloc_async(out_pad.nbytes(), encoder));
-    encoder.add_temporary(out_pad);
-
-    // Run GEMM with padded dimensions.
-    dispatch_sm120_fp4(x, w_pad, s_pad, out_pad, group_size, encoder);
-
-    // Extract first N columns from each row of padded output.
-    // Uses a custom kernel instead of cudaMemcpy2DAsync — much faster on SM121.
-    {
-      int threads = std::min(N, 256);
-      if (elem_size == 2) {
-        extract_columns_kernel<__half><<<M, threads, 0, stream>>>(
-            reinterpret_cast<const __half*>(out_pad.data<void>()),
-            reinterpret_cast<__half*>(out.data<void>()),
-            M, N, N_padded);
-      } else {
-        extract_columns_kernel<float><<<M, threads, 0, stream>>>(
-            reinterpret_cast<const float*>(out_pad.data<void>()),
-            reinterpret_cast<float*>(out.data<void>()),
-            M, N, N_padded);
-      }
-    }
+  if (ldD == N) {
+    dispatch_sm120_fp4(x, w, scales, out, group_size, N, encoder);
     return;
   }
 
-  // Normal aligned path — no padding needed.
-  dispatch_sm120_fp4(x, w, scales, out, group_size, encoder);
+  auto& stream = encoder.stream();
+  array out_pad({M, ldD}, out.dtype(), nullptr, {});
+  out_pad.set_data(cu::malloc_async(out_pad.nbytes(), encoder));
+  encoder.add_temporary(out_pad);
+
+  dispatch_sm120_fp4(x, w, scales, out_pad, group_size, ldD, encoder);
+
+  // Extract first N columns from each row of the stride-padded output.
+  {
+    int threads = std::min(N, 256);
+    if (size_of(out.dtype()) == 2) {
+      extract_columns_kernel<__half><<<M, threads, 0, stream>>>(
+          reinterpret_cast<const __half*>(out_pad.data<void>()),
+          reinterpret_cast<__half*>(out.data<void>()),
+          M, N, ldD);
+    } else {
+      extract_columns_kernel<float><<<M, threads, 0, stream>>>(
+          reinterpret_cast<const float*>(out_pad.data<void>()),
+          reinterpret_cast<float*>(out.data<void>()),
+          M, N, ldD);
+    }
+  }
 }
 
 // ============================================================================
@@ -1476,17 +1460,18 @@ static void dispatch_sm120_fp8(
     const array& scales,
     array& out,
     int group_size,
+    int ldD,
     cu::CommandEncoder& encoder) {
   const char* tag = "[qmm_fp8_sm120]";
 
   if (out.dtype() == bfloat16) {
     void* kernel_ptr = get_configured_kernel_mxfp8_bf16_pp();
     execute_sm120_fp8_gemm<MxFP8_BF16_Gemm_PP, __nv_bfloat16>(
-        kernel_ptr, x, w, scales, out, group_size, encoder);
+        kernel_ptr, x, w, scales, out, group_size, ldD, encoder);
   } else if (out.dtype() == float16) {
     void* kernel_ptr = get_configured_kernel_mxfp8_fp16_pp();
     execute_sm120_fp8_gemm<MxFP8_FP16_Gemm_PP, __half>(
-        kernel_ptr, x, w, scales, out, group_size, encoder);
+        kernel_ptr, x, w, scales, out, group_size, ldD, encoder);
   } else {
     throw std::runtime_error(
         fmt::format("{} Unsupported dtype for SM120 MXFP8 GEMM.", tag));
@@ -1510,48 +1495,37 @@ void cute_qmm_fp8_sm120(
   encoder.set_input_array(scales);
   encoder.set_output_array(out);
 
-  // N-padding for TMA alignment (same pattern as FP4).
-  int N_padded = (N + 127) / 128 * 128;
-  bool needs_n_pad = (N_padded != N);
+  // Same stride-padded output scheme as the FP4 wrapper: run at the true N,
+  // pad only the output row stride to 16-byte alignment when needed.
+  int align_d = 16 / size_of(out.dtype());
+  int ldD = (N + align_d - 1) / align_d * align_d;
 
-  if (needs_n_pad) {
-    auto& stream = encoder.stream();
-    size_t elem_size = size_of(out.dtype());
-
-    // FP8 weights: (N, K) — 1 byte per element.
-    int w_cols = w.shape(-1);
-    array w_pad({N_padded, w_cols}, w.dtype(), nullptr, {});
-    w_pad.set_data(cu::malloc_async(w_pad.nbytes(), encoder));
-    encoder.add_temporary(w_pad);
-    cudaMemsetAsync(w_pad.data<void>(), 0, w_pad.nbytes(), stream);
-    cudaMemcpyAsync(
-        w_pad.data<void>(), w.data<void>(), w.nbytes(),
-        cudaMemcpyDeviceToDevice, stream);
-
-    int s_cols = scales.shape(-1);
-    array s_pad({N_padded, s_cols}, scales.dtype(), nullptr, {});
-    s_pad.set_data(cu::malloc_async(s_pad.nbytes(), encoder));
-    encoder.add_temporary(s_pad);
-    cudaMemsetAsync(s_pad.data<void>(), 0, s_pad.nbytes(), stream);
-    cudaMemcpyAsync(
-        s_pad.data<void>(), scales.data<void>(), scales.nbytes(),
-        cudaMemcpyDeviceToDevice, stream);
-
-    array out_pad({M, N_padded}, out.dtype(), nullptr, {});
-    out_pad.set_data(cu::malloc_async(out_pad.nbytes(), encoder));
-    encoder.add_temporary(out_pad);
-
-    dispatch_sm120_fp8(x, w_pad, s_pad, out_pad, group_size, encoder);
-
-    cudaMemcpy2DAsync(
-        out.data<void>(), N * elem_size,
-        out_pad.data<void>(), N_padded * elem_size,
-        N * elem_size, M,
-        cudaMemcpyDeviceToDevice, stream);
+  if (ldD == N) {
+    dispatch_sm120_fp8(x, w, scales, out, group_size, N, encoder);
     return;
   }
 
-  dispatch_sm120_fp8(x, w, scales, out, group_size, encoder);
+  auto& stream = encoder.stream();
+  array out_pad({M, ldD}, out.dtype(), nullptr, {});
+  out_pad.set_data(cu::malloc_async(out_pad.nbytes(), encoder));
+  encoder.add_temporary(out_pad);
+
+  dispatch_sm120_fp8(x, w, scales, out_pad, group_size, ldD, encoder);
+
+  {
+    int threads = std::min(N, 256);
+    if (size_of(out.dtype()) == 2) {
+      extract_columns_kernel<__half><<<M, threads, 0, stream>>>(
+          reinterpret_cast<const __half*>(out_pad.data<void>()),
+          reinterpret_cast<__half*>(out.data<void>()),
+          M, N, ldD);
+    } else {
+      extract_columns_kernel<float><<<M, threads, 0, stream>>>(
+          reinterpret_cast<const float*>(out_pad.data<void>()),
+          reinterpret_cast<float*>(out.data<void>()),
+          M, N, ldD);
+    }
+  }
 }
 
 void clear_sm120_sf_cache() {
