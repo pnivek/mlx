@@ -604,16 +604,14 @@ std::unordered_map<int, CommandEncoder>& get_global_command_encoders() {
   return encoders;
 }
 
-void Device::clear_graph_caches() {
-  for (auto& [_, enc] : encoders_) {
+void clear_graph_caches() {
+  // Encoders live in a thread-local map plus a global map; clear the ones
+  // visible from the calling thread (the global set covers default streams).
+  for (auto& [_, enc] : get_command_encoders()) {
     enc.clear_graph_cache();
   }
-}
-
-void clear_graph_caches() {
-  int device_count = gpu::device_count();
-  for (int i = 0; i < device_count; ++i) {
-    device(i).clear_graph_caches();
+  for (auto& [_, enc] : get_global_command_encoders()) {
+    enc.clear_graph_cache();
   }
   // Trim memory pools to reclaim reserved memory from destroyed graph execs
   allocator().trim_memory_pools();

@@ -220,9 +220,6 @@ class Device {
     return memory_pools_ == 1;
   }
 
-  // Clear CUDA graph caches for all streams on this device.
-  void clear_graph_caches();
-
  private:
   int device_;
   int compute_capability_major_;
