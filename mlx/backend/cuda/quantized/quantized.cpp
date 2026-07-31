@@ -77,7 +77,10 @@ bool supports_qmm_sm120(
       if (n_out < 1024 || x.shape(-1) < 2048) {
         return false;
       }
-      if (weight_elems < 16ll * 1024 * 1024 && m_total < 1024) {
+      // Small weights only pay off at large M when K is also small
+      // (K=5120 shapes like Qwen3.6 kv win from M=256 despite 10M weights).
+      if (x.shape(-1) <= 4096 &&
+          weight_elems < 16ll * 1024 * 1024 && m_total < 1024) {
         return false;
       }
     }
