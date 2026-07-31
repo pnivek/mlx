@@ -86,11 +86,9 @@ template <
     typename TileShape,
     typename KernelScheduleTag = cutlass::gemm::collective::KernelScheduleAuto,
     // Output alignment in elements. The default enables the TMA epilogue and
-    // requires N % AlignOut == 0; AlignOut=1 with the NoSmemWarpSpecialized
-    // schedule handles arbitrary N (used for shapes like DSv3-MLP N=1407).
-    int AlignOut = 128 / cutlass::sizeof_bits<ElementOut>::value,
-    typename EpilogueScheduleTag =
-        cutlass::epilogue::collective::EpilogueScheduleAuto>
+    // requires N % AlignOut == 0; AlignOut=1 selects a non-TMA epilogue that
+    // handles arbitrary N (used for shapes like DSv3-MLP N=1407).
+    int AlignOut = 128 / cutlass::sizeof_bits<ElementOut>::value>
 struct Sm120BlockScaledGemm {
   // Both A (activation) and B (weight) use the same block-scaled type.
   using ElementA = ElementQuant;
@@ -125,7 +123,7 @@ struct Sm120BlockScaledGemm {
           ElementAccumulator, ElementAccumulator,
           ElementOut, LayoutCTag, AlignC,
           ElementOut, LayoutDTag, AlignD,
-          EpilogueScheduleTag>::CollectiveOp;
+          cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
 
   // Mainloop: handles TMA loads, scale factor routing, MMA pipeline.
   using CollectiveMainloop =
@@ -1141,33 +1139,27 @@ using MxFP4_FP16_Gemm_PP = Sm120BlockScaledGemm<
 using NvFP4_BF16_Gemm_PP_U1 = Sm120BlockScaledGemm<
     cutlass::nv_float4_t<cutlass::float_e2m1_t>,
     cutlass::bfloat16_t, 32, 32, Sm120FP4TileShape,
-    cutlass::gemm::KernelTmaWarpSpecializedPingpongNvf4Sm120, 1,
-    cutlass::epilogue::NoSmemWarpSpecialized>;
+    cutlass::gemm::KernelTmaWarpSpecializedPingpongNvf4Sm120, 1>;
 using NvFP4_FP16_Gemm_PP_U1 = Sm120BlockScaledGemm<
     cutlass::nv_float4_t<cutlass::float_e2m1_t>,
     cutlass::half_t, 32, 32, Sm120FP4TileShape,
-    cutlass::gemm::KernelTmaWarpSpecializedPingpongNvf4Sm120, 1,
-    cutlass::epilogue::NoSmemWarpSpecialized>;
+    cutlass::gemm::KernelTmaWarpSpecializedPingpongNvf4Sm120, 1>;
 using MxFP4_BF16_Gemm_PP_U1 = Sm120BlockScaledGemm<
     cutlass::mx_float4_t<cutlass::float_e2m1_t>,
     cutlass::bfloat16_t, 32, 32, Sm120FP4TileShape,
-    cutlass::gemm::KernelTmaWarpSpecializedPingpongMxf4Sm120, 1,
-    cutlass::epilogue::NoSmemWarpSpecialized>;
+    cutlass::gemm::KernelTmaWarpSpecializedPingpongMxf4Sm120, 1>;
 using MxFP4_FP16_Gemm_PP_U1 = Sm120BlockScaledGemm<
     cutlass::mx_float4_t<cutlass::float_e2m1_t>,
     cutlass::half_t, 32, 32, Sm120FP4TileShape,
-    cutlass::gemm::KernelTmaWarpSpecializedPingpongMxf4Sm120, 1,
-    cutlass::epilogue::NoSmemWarpSpecialized>;
+    cutlass::gemm::KernelTmaWarpSpecializedPingpongMxf4Sm120, 1>;
 using MxFP8_BF16_Gemm_PP_U1 = Sm120BlockScaledGemm<
     cutlass::mx_float8_t<cutlass::float_e4m3_t>,
     cutlass::bfloat16_t, 16, 16, Sm120FP8TileShape,
-    cutlass::gemm::KernelTmaWarpSpecializedPingpongMxf8f6f4Sm120, 1,
-    cutlass::epilogue::NoSmemWarpSpecialized>;
+    cutlass::gemm::KernelTmaWarpSpecializedPingpongMxf8f6f4Sm120, 1>;
 using MxFP8_FP16_Gemm_PP_U1 = Sm120BlockScaledGemm<
     cutlass::mx_float8_t<cutlass::float_e4m3_t>,
     cutlass::half_t, 16, 16, Sm120FP8TileShape,
-    cutlass::gemm::KernelTmaWarpSpecializedPingpongMxf8f6f4Sm120, 1,
-    cutlass::epilogue::NoSmemWarpSpecialized>;
+    cutlass::gemm::KernelTmaWarpSpecializedPingpongMxf8f6f4Sm120, 1>;
 
 // Shared config helper for the unaligned variants.
 template <typename GemmTypeT>
