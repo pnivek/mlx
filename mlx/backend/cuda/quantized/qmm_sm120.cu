@@ -217,6 +217,103 @@ static std::unordered_map<SFBCacheKey, SFBCacheEntry, SFBCacheKeyHash> sfb_cache
 static std::mutex sfb_cache_mutex;
 
 // ============================================================================
+// Padded weight/scale cache for sub-alignment N (N % 8 != 0, e.g. DSv3 1407).
+// Weights are static during inference: pad once, reuse. Entries hold the
+// padded arrays (keeping their buffers alive) plus weak_ptrs to the SOURCE
+// buffers — if the source weight dies, the entry self-invalidates, so pool
+// address reuse can never serve stale data. Because the cached s_pad pointer
+// is stable across calls, the SFB cache keyed on it also stays warm.
+// ============================================================================
+struct NPadKey {
+  const void* w_ptr;
+  const void* s_ptr;
+  int N, K;
+  bool operator==(const NPadKey& o) const {
+    return w_ptr == o.w_ptr && s_ptr == o.s_ptr && N == o.N && K == o.K;
+  }
+};
+
+struct NPadKeyHash {
+  size_t operator()(const NPadKey& k) const {
+    size_t h = std::hash<const void*>{}(k.w_ptr);
+    h ^= std::hash<const void*>{}(k.s_ptr) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    h ^= std::hash<int>{}(k.N) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    h ^= std::hash<int>{}(k.K) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    return h;
+  }
+};
+
+struct NPadEntry {
+  array w_pad;
+  array s_pad;
+  std::weak_ptr<array::Data> w_alive;
+  std::weak_ptr<array::Data> s_alive;
+};
+
+static std::unordered_map<NPadKey, NPadEntry, NPadKeyHash> npad_cache;
+static std::mutex npad_cache_mutex;
+
+// Get (or build) the padded (N8-row) copies of w and scales. Runs on the
+// encoder stream in direct-launch mode; a sync before caching makes the
+// buffers safe for use from other streams on later calls.
+static std::pair<array, array> get_or_pad_ws(
+    const array& w,
+    const array& scales,
+    int N,
+    int N8,
+    cu::CommandEncoder& encoder) {
+  NPadKey key{w.data<void>(), scales.data<void>(), N, w.shape(-1)};
+  {
+    std::lock_guard<std::mutex> lock(npad_cache_mutex);
+    auto it = npad_cache.find(key);
+    if (it != npad_cache.end()) {
+      if (!it->second.w_alive.expired() && !it->second.s_alive.expired()) {
+        return {it->second.w_pad, it->second.s_pad};
+      }
+      npad_cache.erase(it);
+    }
+  }
+
+  auto& stream = encoder.stream();
+  size_t w_row = static_cast<size_t>(w.shape(-1)) * w.itemsize();
+  array w_pad({N8, w.shape(-1)}, w.dtype(), nullptr, {});
+  w_pad.set_data(cu::malloc_async(w_pad.nbytes(), encoder));
+  cudaMemcpyAsync(
+      w_pad.data<void>(), w.data<void>(), w.nbytes(),
+      cudaMemcpyDeviceToDevice, stream);
+  cudaMemsetAsync(
+      static_cast<char*>(w_pad.data<void>()) + N * w_row,
+      0, (N8 - N) * w_row, stream);
+
+  size_t s_row = static_cast<size_t>(scales.shape(-1)) * scales.itemsize();
+  array s_pad({N8, scales.shape(-1)}, scales.dtype(), nullptr, {});
+  s_pad.set_data(cu::malloc_async(s_pad.nbytes(), encoder));
+  cudaMemcpyAsync(
+      s_pad.data<void>(), scales.data<void>(), scales.nbytes(),
+      cudaMemcpyDeviceToDevice, stream);
+  cudaMemsetAsync(
+      static_cast<char*>(s_pad.data<void>()) + N * s_row,
+      0, (N8 - N) * s_row, stream);
+
+  cudaStreamSynchronize(stream);
+
+  {
+    std::lock_guard<std::mutex> lock(npad_cache_mutex);
+    auto it = npad_cache.find(key);
+    if (it == npad_cache.end()) {
+      npad_cache.emplace(
+          key,
+          NPadEntry{
+              w_pad,
+              s_pad,
+              w.data_shared_ptr(),
+              scales.data_shared_ptr()});
+    }
+  }
+  return {w_pad, s_pad};
+}
+
+// ============================================================================
 // Scale factor reformatting kernel.
 //
 // Copies weight scale factors from MLX format (SFType, row-major) to
@@ -1421,29 +1518,10 @@ void cute_qmm_fp4_sm120(
   }
   int N8 = (N + align_d - 1) / align_d * align_d;
 
+  // Padded copies are cached across calls (weights are static); the cache
+  // self-invalidates via weak_ptrs when the source weight dies.
+  auto [w_pad, s_pad] = get_or_pad_ws(w, scales, N, N8, encoder);
   auto& stream = encoder.stream();
-  size_t w_row = static_cast<size_t>(w.shape(-1)) * w.itemsize();
-  array w_pad({N8, w.shape(-1)}, w.dtype(), nullptr, {});
-  w_pad.set_data(cu::malloc_async(w_pad.nbytes(), encoder));
-  encoder.add_temporary(w_pad);
-  cudaMemcpyAsync(
-      w_pad.data<void>(), w.data<void>(), w.nbytes(),
-      cudaMemcpyDeviceToDevice, stream);
-  cudaMemsetAsync(
-      static_cast<char*>(w_pad.data<void>()) + N * w_row,
-      0, (N8 - N) * w_row, stream);
-
-  size_t s_row = static_cast<size_t>(scales.shape(-1)) * scales.itemsize();
-  array s_pad({N8, scales.shape(-1)}, scales.dtype(), nullptr, {});
-  s_pad.set_data(cu::malloc_async(s_pad.nbytes(), encoder));
-  encoder.add_temporary(s_pad);
-  cudaMemcpyAsync(
-      s_pad.data<void>(), scales.data<void>(), scales.nbytes(),
-      cudaMemcpyDeviceToDevice, stream);
-  cudaMemsetAsync(
-      static_cast<char*>(s_pad.data<void>()) + N * s_row,
-      0, (N8 - N) * s_row, stream);
-
   array out_pad({M, N8}, out.dtype(), nullptr, {});
   out_pad.set_data(cu::malloc_async(out_pad.nbytes(), encoder));
   encoder.add_temporary(out_pad);
@@ -1527,29 +1605,10 @@ void cute_qmm_fp8_sm120(
   }
   int N8 = (N + align_d - 1) / align_d * align_d;
 
+  // Padded copies are cached across calls (weights are static); the cache
+  // self-invalidates via weak_ptrs when the source weight dies.
+  auto [w_pad, s_pad] = get_or_pad_ws(w, scales, N, N8, encoder);
   auto& stream = encoder.stream();
-  size_t w_row = static_cast<size_t>(w.shape(-1)) * w.itemsize();
-  array w_pad({N8, w.shape(-1)}, w.dtype(), nullptr, {});
-  w_pad.set_data(cu::malloc_async(w_pad.nbytes(), encoder));
-  encoder.add_temporary(w_pad);
-  cudaMemcpyAsync(
-      w_pad.data<void>(), w.data<void>(), w.nbytes(),
-      cudaMemcpyDeviceToDevice, stream);
-  cudaMemsetAsync(
-      static_cast<char*>(w_pad.data<void>()) + N * w_row,
-      0, (N8 - N) * w_row, stream);
-
-  size_t s_row = static_cast<size_t>(scales.shape(-1)) * scales.itemsize();
-  array s_pad({N8, scales.shape(-1)}, scales.dtype(), nullptr, {});
-  s_pad.set_data(cu::malloc_async(s_pad.nbytes(), encoder));
-  encoder.add_temporary(s_pad);
-  cudaMemcpyAsync(
-      s_pad.data<void>(), scales.data<void>(), scales.nbytes(),
-      cudaMemcpyDeviceToDevice, stream);
-  cudaMemsetAsync(
-      static_cast<char*>(s_pad.data<void>()) + N * s_row,
-      0, (N8 - N) * s_row, stream);
-
   array out_pad({M, N8}, out.dtype(), nullptr, {});
   out_pad.set_data(cu::malloc_async(out_pad.nbytes(), encoder));
   encoder.add_temporary(out_pad);
