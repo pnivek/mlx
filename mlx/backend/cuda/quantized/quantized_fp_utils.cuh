@@ -9,6 +9,33 @@
 
 namespace mlx::core::cu {
 
+// Round a positive float up to the nearest power of two (the E8M0 grid).
+inline __device__ float round_up_pow2(float v) {
+  uint32_t bits = __float_as_uint(v);
+  uint32_t exp = (bits >> 23) & 0xffu;
+  bool is_pow2 = (bits & 0x7fffffu) == 0;
+  return __uint_as_float((is_pow2 ? exp : exp + 1) << 23);
+}
+
+// Group scale for block-scaled activation quantization.
+// inv_max_rep = 1/max_representable of the element type (1/6 for E2M1,
+// 1/448 for E4M3). E8M0-scaled formats (MXFP4/MXFP8) can only store powers
+// of two, so the scale used to quantize a group must be the SAME power of
+// two that is stored — quantizing against the continuous amax-based scale
+// and storing its E8M0 rounding inflates every group by up to 2x.
+// Continuous scales are fine for UE4M3-scaled NVFP4.
+template <bool kUE8M0>
+inline __device__ float block_group_scale(float amax, float inv_max_rep) {
+  if (amax <= 0.0f) {
+    return 1.0f;
+  }
+  float s = amax * inv_max_rep;
+  if constexpr (kUE8M0) {
+    return round_up_pow2(s);
+  }
+  return s;
+}
+
 inline __device__ float4 dequant_fp8(uint32_t bits) {
   auto out = *(__nv_fp8x4_e4m3*)(&bits);
   return out.operator float4();

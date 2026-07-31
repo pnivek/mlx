@@ -13,6 +13,7 @@
 
 #include "mlx/backend/cuda/quantized/gather_qmm.h"
 #include "mlx/backend/cuda/quantized/quantized.h"
+#include "mlx/backend/cuda/quantized/quantized_fp_utils.cuh"
 #include "mlx/backend/cuda/quantized/quantized_utils.h"
 #include "mlx/backend/cuda/device.h"
 #include "mlx/backend/cuda/cuda_utils.h"
@@ -291,7 +292,8 @@ __global__ void grouped_quant_fp4_fp16(
   #pragma unroll
   for (int off = TPG / 2; off > 0; off >>= 1)
     am = fmaxf(am, __shfl_xor_sync(mask, am, off));
-  float sc = (am > 0.f) ? (am / 6.f) : 1.f;
+  float sc = cu::block_group_scale<
+      cute::is_same_v<SFType, cutlass::float_ue8m0_t>>(am, 1.f / 6.f);
   float isc = 1.f / sc;
   if (v && ll == 0) sf[layout(m, g * SF_VEC_SIZE, 0)] = static_cast<SFType>(sc);
   if (v) {
@@ -330,7 +332,8 @@ __global__ void grouped_quant_fp4_bf16(
   #pragma unroll
   for (int off = TPG / 2; off > 0; off >>= 1)
     am = fmaxf(am, __shfl_xor_sync(mask, am, off));
-  float sc = (am > 0.f) ? (am / 6.f) : 1.f;
+  float sc = cu::block_group_scale<
+      cute::is_same_v<SFType, cutlass::float_ue8m0_t>>(am, 1.f / 6.f);
   float isc = 1.f / sc;
   if (v && ll == 0) sf[layout(m, g * SF_VEC_SIZE, 0)] = static_cast<SFType>(sc);
   if (v) {
@@ -359,7 +362,15 @@ struct GroupedSFBHash {
     return h;
   }
 };
-static std::unordered_map<GroupedSFBKey, void*, GroupedSFBHash> g_grouped_sfb_cache;
+struct GroupedSFBEntry {
+  void* device_ptr;
+  // Liveness of the source scales buffer — MLX's pool reuses freed
+  // addresses, so a raw-pointer key false-hits when a same-shape weight is
+  // reallocated at a dead weight's address. Expired => entry is stale.
+  std::weak_ptr<array::Data> src_alive;
+};
+static std::unordered_map<GroupedSFBKey, GroupedSFBEntry, GroupedSFBHash>
+    g_grouped_sfb_cache;
 static std::mutex g_grouped_sfb_mutex;
 
 // ============================================================================
@@ -502,19 +513,25 @@ static void configure_smem_mxfp4_bf16() {
 // ============================================================================
 template <typename GemmType>
 static void* get_or_reformat_grouped_sfb(
-    const void* raw_scales,  // [E, N_src, K/gs] MLX row-major
+    const array& scales,  // [E, N_src, K/gs] MLX row-major
     int E, int N_src, int N_padded, int K, int group_size,
     cudaStream_t stream) {
   using ScaleConfig = typename GemmType::ScaleConfig;
   using LayoutSFB   = typename GemmType::LayoutSFB;
   using SFType      = typename GemmType::SFType;
 
+  const void* raw_scales = scales.data<void>();
   GroupedSFBKey key{raw_scales, E, N_padded, K, group_size};
   {
     std::lock_guard<std::mutex> lk(g_grouped_sfb_mutex);
     auto it = g_grouped_sfb_cache.find(key);
-    if (it != g_grouped_sfb_cache.end())
-      return it->second;
+    if (it != g_grouped_sfb_cache.end()) {
+      if (!it->second.src_alive.expired()) {
+        return it->second.device_ptr;
+      }
+      cudaFree(it->second.device_ptr);
+      g_grouped_sfb_cache.erase(it);
+    }
   }
 
   int sf_vec_size = ScaleConfig::SFVecSize;
@@ -542,9 +559,9 @@ static void* get_or_reformat_grouped_sfb(
     auto it = g_grouped_sfb_cache.find(key);
     if (it != g_grouped_sfb_cache.end()) {
       cudaFree(dst);
-      return it->second;
+      return it->second.device_ptr;
     }
-    g_grouped_sfb_cache[key] = dst;
+    g_grouped_sfb_cache[key] = {dst, scales.data_shared_ptr()};
   }
   return dst;
 }
@@ -889,17 +906,17 @@ void gather_qmm_grouped_gpu(
   if (mode == QuantizationMode::Nvfp4) {
     if (out.dtype() == float16)
       grouped_sfb = get_or_reformat_grouped_sfb<NvFP4G_FP16>(
-          scales.data<void>(), E, N, N_padded, K, group_size, enc.stream());
+          scales, E, N, N_padded, K, group_size, enc.stream());
     else
       grouped_sfb = get_or_reformat_grouped_sfb<NvFP4G_BF16>(
-          scales.data<void>(), E, N, N_padded, K, group_size, enc.stream());
+          scales, E, N, N_padded, K, group_size, enc.stream());
   } else {
     if (out.dtype() == float16)
       grouped_sfb = get_or_reformat_grouped_sfb<MxFP4G_FP16>(
-          scales.data<void>(), E, N, N_padded, K, group_size, enc.stream());
+          scales, E, N, N_padded, K, group_size, enc.stream());
     else
       grouped_sfb = get_or_reformat_grouped_sfb<MxFP4G_BF16>(
-          scales.data<void>(), E, N, N_padded, K, group_size, enc.stream());
+          scales, E, N, N_padded, K, group_size, enc.stream());
   }
 
   // ── Phase 6: Allocate sorted output buffer ──────────────────────────────

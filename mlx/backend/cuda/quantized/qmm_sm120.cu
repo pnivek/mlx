@@ -25,6 +25,7 @@
 //       https://forums.developer.nvidia.com/t/custom-fp4-cuda-kernel-129-tflops-on-dgx-spark-with-pre-quantized-weight-cache/361600
 
 #include "mlx/backend/cuda/quantized/qmm_sm120.h"
+#include "mlx/backend/cuda/quantized/quantized_fp_utils.cuh"
 #include "mlx/backend/cuda/kernel_utils.cuh"
 #include "mlx/backend/cuda/utils.h"
 #include "mlx/dtype_utils.h"
@@ -378,32 +379,6 @@ __global__ void extract_columns_kernel(
 // ============================================================================
 
 // FP4 activation quantization — FP16 input, vectorized.
-// Round a positive float up to the nearest power of two (the E8M0 grid).
-// E8M0 scale factors can only store powers of two, so the scale used to
-// quantize a group must be the SAME power of two that is stored — quantizing
-// against the continuous amax/max_rep scale and then storing its E8M0
-// rounding inflates every group by up to 2x.
-__device__ __forceinline__ float round_up_pow2(float v) {
-  uint32_t bits = __float_as_uint(v);
-  uint32_t exp = (bits >> 23) & 0xffu;
-  bool is_pow2 = (bits & 0x7fffffu) == 0;
-  return __uint_as_float((is_pow2 ? exp : exp + 1) << 23);
-}
-
-// Compute the group scale for FP4 activation quantization. NVFP4 stores
-// UE4M3 scales (continuous is fine); MXFP4 stores UE8M0 (power of two).
-template <typename SFType>
-__device__ __forceinline__ float fp4_group_scale(float local_amax) {
-  if (local_amax <= 0.0f) {
-    return 1.0f;
-  }
-  if constexpr (cute::is_same_v<SFType, cutlass::float_ue8m0_t>) {
-    return round_up_pow2(local_amax * (1.0f / 6.0f));
-  } else {
-    return local_amax / 6.0f;
-  }
-}
-
 // Each thread processes ELEMS_PER_THREAD=4 consecutive elements via uint2 load.
 // SF_VEC_SIZE: 16 (NVFP4) or 32 (MXFP4). Templated for compile-time optimization.
 template <int SF_VEC_SIZE, int ELEMS_PER_THREAD, typename SFType, typename LayoutSF>
@@ -453,7 +428,9 @@ __global__ void quantize_activation_fp4_kernel(
     local_amax = fmaxf(local_amax, __shfl_xor_sync(sub_mask, local_amax, offset));
   }
 
-  float scale = fp4_group_scale<SFType>(local_amax);
+  float scale = cu::block_group_scale<
+      cute::is_same_v<SFType, cutlass::float_ue8m0_t>>(
+      local_amax, 1.0f / 6.0f);
   float inv_scale = 1.0f / scale;
 
   if (valid && local_lane == 0) {
@@ -521,7 +498,9 @@ __global__ void quantize_activation_fp4_bf16_kernel(
     local_amax = fmaxf(local_amax, __shfl_xor_sync(sub_mask, local_amax, offset));
   }
 
-  float scale = fp4_group_scale<SFType>(local_amax);
+  float scale = cu::block_group_scale<
+      cute::is_same_v<SFType, cutlass::float_ue8m0_t>>(
+      local_amax, 1.0f / 6.0f);
   float inv_scale = 1.0f / scale;
 
   if (valid && local_lane == 0) {
@@ -598,9 +577,7 @@ __global__ void quantize_activation_fp8_kernel(
   }
 
   // MXFP8 stores UE8M0 scales: quantize against the stored power of two.
-  float scale = (local_amax > 0.0f)
-      ? round_up_pow2(local_amax * (1.0f / 448.0f))
-      : 1.0f;
+  float scale = cu::block_group_scale<true>(local_amax, 1.0f / 448.0f);
   float inv_scale = 1.0f / scale;
 
   if (valid && local_lane == 0) {
@@ -671,9 +648,7 @@ __global__ void quantize_activation_fp8_bf16_kernel(
   }
 
   // MXFP8 stores UE8M0 scales: quantize against the stored power of two.
-  float scale = (local_amax > 0.0f)
-      ? round_up_pow2(local_amax * (1.0f / 448.0f))
-      : 1.0f;
+  float scale = cu::block_group_scale<true>(local_amax, 1.0f / 448.0f);
   float inv_scale = 1.0f / scale;
 
   if (valid && local_lane == 0) {
