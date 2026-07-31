@@ -116,7 +116,13 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
         mode_ == QuantizationMode::Nvfp4) {
       bool cute_aligned = (N % 128 == 0) && (K % 64 == 0);
       if (K % 128 == 0) {
+        // SM120 GEMM launches kernels directly on the stream (not as graph
+        // nodes). Flush pending graph ops so inputs produced in this eval are
+        // materialized before the eager kernels read them.
+        enc.commit();
+        enc.begin_direct_launch();
         cute_qmm_fp4_sm120(x, w, scales, out, bits_, group_size_, enc);
+        enc.end_direct_launch();
       } else if (cute_aligned) {
         cute_qmm_fp4(x, w, scales, out, bits_, group_size_, enc);
       } else {
@@ -131,7 +137,11 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     // MXFP8: SM120 native (M<=2048) > dequant+cuBLAS.
     if (mode_ == QuantizationMode::Mxfp8) {
       if ((K % 128 == 0) && M <= 2048) {
+        // Same direct-launch protection as the FP4 SM120 path above.
+        enc.commit();
+        enc.begin_direct_launch();
         cute_qmm_fp8_sm120(x, w, scales, out, group_size_, enc);
+        enc.end_direct_launch();
         return;
       }
       array w_dequant = alloc_dequant_buffer(N, K, out.dtype(), enc);
