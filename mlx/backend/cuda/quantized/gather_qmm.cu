@@ -539,7 +539,10 @@ void gather_qmm_sm120_gpu(
   array lhs_flat = ensure_row_contiguous(lhs_indices, enc, s);
   array rhs_flat = ensure_row_contiguous(rhs_indices, enc, s);
 
+  // Drain in-flight work before the direct-launch window (see
+  // gather_qmm_grouped.cu for rationale).
   enc.commit();
+  enc.synchronize();
   enc.begin_direct_launch();
 
   auto sorted = sort_gather_indices(lhs_flat, rhs_flat, B, E, enc, s);

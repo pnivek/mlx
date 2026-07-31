@@ -812,7 +812,11 @@ void gather_qmm_grouped_gpu(
   array lhs_flat = ensure_row_contiguous(lhs_indices, enc, s);
   array rhs_flat = ensure_row_contiguous(rhs_indices, enc, s);
 
+  // Drain in-flight work: allocations made inside the direct-launch window
+  // are not tied to graph completion, so the pool could otherwise hand them
+  // memory still referenced by pending kernels.
   enc.commit();
+  enc.synchronize();
   enc.begin_direct_launch();
 
   // ── Phase 1: On-device counting sort by expert ──────────────────────────

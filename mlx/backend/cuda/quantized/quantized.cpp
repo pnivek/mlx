@@ -94,8 +94,13 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     out.set_data(cu::malloc_async(out.nbytes(), encoder));
     // The SM120 GEMM launches kernels directly on the stream (not as graph
     // nodes). Flush pending graph ops so inputs produced in this eval are
-    // materialized before the eager kernels read them.
+    // materialized before the eager kernels read them, and drain in-flight
+    // work: allocations made inside the direct-launch window are not tied to
+    // graph completion, so without the drain the pool can hand them memory
+    // still referenced by pending kernels (observed as whole-buffer
+    // corruption of live inputs under allocation churn).
     encoder.commit();
+    encoder.synchronize();
     encoder.begin_direct_launch();
     if (bits_ == 4) {
       cute_qmm_fp4_sm120(x, w, scales, out, bits_, group_size_, encoder);
