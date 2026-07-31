@@ -1,5 +1,6 @@
 // Copyright © 2025 Apple Inc.
 
+#include "mlx/backend/cuda/allocator.h"
 #include "mlx/backend/cuda/device.h"
 #include "mlx/backend/cuda/worker.h"
 #include "mlx/backend/gpu/device_info.h"
@@ -70,7 +71,7 @@ void Device::make_current() {
 
 CommandEncoder::CaptureContext::CaptureContext(CommandEncoder& enc) : enc(enc) {
   enc.device().make_current();
-  if (!use_cuda_graphs()) {
+  if (!use_cuda_graphs() || enc.direct_launch_) {
     return;
   }
   CHECK_CUDA_ERROR(
@@ -78,7 +79,7 @@ CommandEncoder::CaptureContext::CaptureContext(CommandEncoder& enc) : enc(enc) {
 }
 
 CommandEncoder::CaptureContext::~CaptureContext() {
-  if (!use_cuda_graphs()) {
+  if (!use_cuda_graphs() || enc.direct_launch_) {
     enc.node_count_++;
     return;
   }
@@ -194,9 +195,9 @@ std::pair<int, int> get_graph_limits(Device& d) {
       ops = 100;
       mb = 1000;
       break;
-    case 1210: // DGX Spark
-      ops = 20;
-      mb = 25;
+    case 1210: // DGX Spark / GB10 (128GB unified memory)
+      ops = 100;
+      mb = 200;
       break;
   }
   return {env::max_ops_per_buffer(ops), env::max_mb_per_buffer(mb)};
@@ -250,7 +251,7 @@ void CommandEncoder::add_kernel_node_raw(
   bool use_cluster = !is_empty_dim(cluster_dim);
   assert(!use_cluster || device_.compute_capability_major() >= 9);
 
-  if (!use_cuda_graphs()) {
+  if (!use_cuda_graphs() || direct_launch_) {
     node_count_++;
     cudaLaunchConfig_t config = {};
     config.gridDim = grid_dim;
@@ -297,7 +298,7 @@ void CommandEncoder::add_kernel_node_raw(
   bool use_cluster = !is_empty_dim(cluster_dim);
   assert(!use_cluster || device_.compute_capability_major() >= 9);
 
-  if (!use_cuda_graphs()) {
+  if (!use_cuda_graphs() || direct_launch_) {
     node_count_++;
     CUlaunchConfig config = {};
     config.gridDimX = grid_dim.x;
@@ -346,7 +347,17 @@ cudaGraphNode_t CommandEncoder::add_kernel_node_raw(
     const cudaKernelNodeParams& params) {
   cudaGraphNode_t node;
   CHECK_CUDA_ERROR(cudaGraphAddKernelNode(&node, graph_, NULL, 0, &params));
-  insert_graph_dependencies(GraphNode{node, "K"});
+  // SM12x: cudaGraphExecUpdate silently corrupts execution when updating a
+  // cached exec with a different kernel function. Include func ptr in key
+  // to prevent cross-kernel cache reuse. On other GPUs, use topology-only
+  // keys for better cache hit rates.
+  std::string key;
+  if (device_.compute_capability_major() >= 12) {
+    key = fmt::format("K{:x}", reinterpret_cast<uintptr_t>(params.func));
+  } else {
+    key = "K";
+  }
+  insert_graph_dependencies(GraphNode{node, key});
   return node;
 }
 
@@ -354,7 +365,13 @@ CUgraphNode CommandEncoder::add_kernel_node_raw(
     const CUDA_KERNEL_NODE_PARAMS& params) {
   CUgraphNode node;
   CHECK_CUDA_ERROR(cuGraphAddKernelNode(&node, graph_, NULL, 0, &params));
-  insert_graph_dependencies(GraphNode{node, "K"});
+  std::string key;
+  if (device_.compute_capability_major() >= 12) {
+    key = fmt::format("K{:x}", reinterpret_cast<uintptr_t>(params.func));
+  } else {
+    key = "K";
+  }
+  insert_graph_dependencies(GraphNode{node, key});
   return node;
 }
 
@@ -585,6 +602,25 @@ std::unordered_map<int, CommandEncoder>& get_command_encoders() {
 std::unordered_map<int, CommandEncoder>& get_global_command_encoders() {
   static std::unordered_map<int, CommandEncoder> encoders;
   return encoders;
+}
+
+void Device::clear_graph_caches() {
+  for (auto& [_, enc] : encoders_) {
+    enc.clear_graph_cache();
+  }
+}
+
+void clear_graph_caches() {
+  int device_count = gpu::device_count();
+  for (int i = 0; i < device_count; ++i) {
+    device(i).clear_graph_caches();
+  }
+  // Trim memory pools to reclaim reserved memory from destroyed graph execs
+  allocator().trim_memory_pools();
+}
+
+std::pair<size_t, size_t> get_pool_memory() {
+  return allocator().get_pool_memory();
 }
 
 } // namespace mlx::core::cu
