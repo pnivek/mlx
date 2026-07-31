@@ -205,6 +205,11 @@ struct SFBCacheKeyHash {
 struct SFBCacheEntry {
   void* device_ptr;
   size_t size_bytes;
+  // Liveness of the source scales buffer. MLX's pool reuses freed addresses,
+  // so a raw-pointer key alone can false-hit when a same-shape weight is
+  // reallocated at the address of a dead one. If the original array's Data
+  // is gone, this entry is stale regardless of the pointer matching.
+  std::weak_ptr<array::Data> src_alive;
 };
 
 static std::unordered_map<SFBCacheKey, SFBCacheEntry, SFBCacheKeyHash> sfb_cache;
@@ -250,7 +255,7 @@ __global__ void reformat_sf_kernel(
 // eliminating the ~64 µs (FP4) / ~33 µs (FP8) reformat overhead.
 template <typename GemmType>
 static void* get_or_reformat_sfb(
-    const void* raw_scales,
+    const array& scales,
     int N,
     int K,
     int group_size,
@@ -260,13 +265,21 @@ static void* get_or_reformat_sfb(
   using ElementA = typename GemmType::ElementA;
   using SFType = typename ElementA::ScaleFactorType;
 
+  const void* raw_scales = scales.data<void>();
   SFBCacheKey key{raw_scales, N, K, group_size};
 
   {
     std::lock_guard<std::mutex> lock(sfb_cache_mutex);
     auto it = sfb_cache.find(key);
     if (it != sfb_cache.end()) {
-      return it->second.device_ptr;
+      // Hit is only valid if the source buffer that produced the entry is
+      // still alive; a dead source means the address may have been reused
+      // by a different weight of the same shape.
+      if (!it->second.src_alive.expired()) {
+        return it->second.device_ptr;
+      }
+      cudaFree(it->second.device_ptr);
+      sfb_cache.erase(it);
     }
   }
 
@@ -305,7 +318,7 @@ static void* get_or_reformat_sfb(
       cudaFree(sfb_ptr); // Another thread won the race.
       return it->second.device_ptr;
     }
-    sfb_cache[key] = {sfb_ptr, sfb_bytes};
+    sfb_cache[key] = {sfb_ptr, sfb_bytes, scales.data_shared_ptr()};
   }
 
   return sfb_ptr;
@@ -365,6 +378,32 @@ __global__ void extract_columns_kernel(
 // ============================================================================
 
 // FP4 activation quantization — FP16 input, vectorized.
+// Round a positive float up to the nearest power of two (the E8M0 grid).
+// E8M0 scale factors can only store powers of two, so the scale used to
+// quantize a group must be the SAME power of two that is stored — quantizing
+// against the continuous amax/max_rep scale and then storing its E8M0
+// rounding inflates every group by up to 2x.
+__device__ __forceinline__ float round_up_pow2(float v) {
+  uint32_t bits = __float_as_uint(v);
+  uint32_t exp = (bits >> 23) & 0xffu;
+  bool is_pow2 = (bits & 0x7fffffu) == 0;
+  return __uint_as_float((is_pow2 ? exp : exp + 1) << 23);
+}
+
+// Compute the group scale for FP4 activation quantization. NVFP4 stores
+// UE4M3 scales (continuous is fine); MXFP4 stores UE8M0 (power of two).
+template <typename SFType>
+__device__ __forceinline__ float fp4_group_scale(float local_amax) {
+  if (local_amax <= 0.0f) {
+    return 1.0f;
+  }
+  if constexpr (cute::is_same_v<SFType, cutlass::float_ue8m0_t>) {
+    return round_up_pow2(local_amax * (1.0f / 6.0f));
+  } else {
+    return local_amax / 6.0f;
+  }
+}
+
 // Each thread processes ELEMS_PER_THREAD=4 consecutive elements via uint2 load.
 // SF_VEC_SIZE: 16 (NVFP4) or 32 (MXFP4). Templated for compile-time optimization.
 template <int SF_VEC_SIZE, int ELEMS_PER_THREAD, typename SFType, typename LayoutSF>
@@ -414,7 +453,7 @@ __global__ void quantize_activation_fp4_kernel(
     local_amax = fmaxf(local_amax, __shfl_xor_sync(sub_mask, local_amax, offset));
   }
 
-  float scale = (local_amax > 0.0f) ? (local_amax / 6.0f) : 1.0f;
+  float scale = fp4_group_scale<SFType>(local_amax);
   float inv_scale = 1.0f / scale;
 
   if (valid && local_lane == 0) {
@@ -482,7 +521,7 @@ __global__ void quantize_activation_fp4_bf16_kernel(
     local_amax = fmaxf(local_amax, __shfl_xor_sync(sub_mask, local_amax, offset));
   }
 
-  float scale = (local_amax > 0.0f) ? (local_amax / 6.0f) : 1.0f;
+  float scale = fp4_group_scale<SFType>(local_amax);
   float inv_scale = 1.0f / scale;
 
   if (valid && local_lane == 0) {
@@ -558,7 +597,10 @@ __global__ void quantize_activation_fp8_kernel(
     local_amax = fmaxf(local_amax, __shfl_xor_sync(sub_mask, local_amax, offset));
   }
 
-  float scale = (local_amax > 0.0f) ? (local_amax / 448.0f) : 1.0f;
+  // MXFP8 stores UE8M0 scales: quantize against the stored power of two.
+  float scale = (local_amax > 0.0f)
+      ? round_up_pow2(local_amax * (1.0f / 448.0f))
+      : 1.0f;
   float inv_scale = 1.0f / scale;
 
   if (valid && local_lane == 0) {
@@ -628,7 +670,10 @@ __global__ void quantize_activation_fp8_bf16_kernel(
     local_amax = fmaxf(local_amax, __shfl_xor_sync(sub_mask, local_amax, offset));
   }
 
-  float scale = (local_amax > 0.0f) ? (local_amax / 448.0f) : 1.0f;
+  // MXFP8 stores UE8M0 scales: quantize against the stored power of two.
+  float scale = (local_amax > 0.0f)
+      ? round_up_pow2(local_amax * (1.0f / 448.0f))
+      : 1.0f;
   float inv_scale = 1.0f / scale;
 
   if (valid && local_lane == 0) {
@@ -905,7 +950,7 @@ void execute_sm120_fp4_gemm(
   // Step 2: Get cached reformatted weight scale factors.
   // layout_SFB depends only on (N, K, BlkConfig), not M — safe to cache.
   void* sfb_ptr = get_or_reformat_sfb<GemmType>(
-      scales.data<void>(), N, K, group_size, stream);
+      scales, N, K, group_size, stream);
 
   // Step 3: Run CUTLASS block-scaled GEMM.
   // Weight data (w) is passed directly — no transpose needed.
@@ -999,7 +1044,7 @@ void execute_sm120_fp8_gemm(
 
   // Step 2: Get cached reformatted weight scale factors.
   void* sfb_ptr = get_or_reformat_sfb<GemmType>(
-      scales.data<void>(), N, K, group_size, stream);
+      scales, N, K, group_size, stream);
 
   // Step 3: Run CUTLASS block-scaled GEMM.
   // FP8 weight data stored as (N, K) row-major — K contiguous, same as FP4.
