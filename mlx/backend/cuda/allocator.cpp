@@ -164,17 +164,6 @@ CudaAllocator::CudaAllocator()
       uint64_t threshold = free_limit_;
       cudaMemPoolSetAttribute(
           mem_pools_[i], cudaMemPoolAttrReleaseThreshold, &threshold);
-      // Buffers are frequently released from a worker thread whose default
-      // stream differs from the compute stream. Opportunistic reuse lets the
-      // pool recycle such memory for compute-stream allocations without an
-      // event dependency, which compute-sanitizer flags as use-after-free
-      // and which intermittently corrupts results (zeros/NaN) under
-      // allocation churn. Require tracked event dependencies for reuse.
-      int allow_opportunistic = 0;
-      cudaMemPoolSetAttribute(
-          mem_pools_[i],
-          cudaMemPoolReuseAllowOpportunistic,
-          &allow_opportunistic);
     }
   }
   CHECK_CUDA_ERROR(cudaSetDevice(curr));
