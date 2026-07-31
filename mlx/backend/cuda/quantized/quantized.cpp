@@ -46,9 +46,25 @@ bool supports_qmm_sm120(
   if (x.shape(-1) % 128 != 0) {
     return false;
   }
+  int64_t m_total = out.size() / out.shape(-1);
+  int64_t weight_elems =
+      static_cast<int64_t>(w.shape(-2)) * x.shape(-1);
   if (mode == QuantizationMode::Mxfp8) {
-    int64_t m_total = out.size() / out.shape(-1);
-    if (m_total > 2048) {
+    // Sweep vs upstream sm80 (2026-07): the FP8 SM120 GEMM only wins at
+    // large M on large weights (N*K >= 32M separates winners exactly).
+    if (m_total < 512 || m_total > 2048 ||
+        weight_elems < 32ll * 1024 * 1024) {
+      return false;
+    }
+  } else {
+    // FP4: sm80 wins the small-M band; SM120 wins from ~M=64-128 up.
+    if (m_total > 8 && m_total < 64) {
+      return false;
+    }
+    // NVFP4 with sub-alignment N: upstream's nvfp4 chain beats the
+    // minimal-pad path at every M (MXFP4 odd-N stays ours: 2.3-5.4x wins).
+    if (mode == QuantizationMode::Nvfp4 &&
+        out.shape(-1) % (16 / out.itemsize()) != 0) {
       return false;
     }
   }
@@ -170,32 +186,10 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   if (can_use_qmm_sm120) {
     // Small batches decode faster through QMV (reads weights once per row).
-    int qmv_threshold = 8;
-    if (mode_ == QuantizationMode::Mxfp8 &&
-        static_cast<int64_t>(N) * K < 32ll * 1024 * 1024) {
-      qmv_threshold = 16;
-    }
-    if (can_use_qmv && (M * B <= qmv_threshold)) {
+    if (can_use_qmv && (M * B <= 8)) {
       call_qmv();
     } else {
       call_qmm_sm120();
-    }
-    return;
-  }
-
-  // FP4 shapes that miss the K%128 SM120 constraint but satisfy the CuTe
-  // kernel's alignment (e.g. gpt-oss K=2880): CuTe tensor-core QMM.
-  if (encoder.device().compute_capability_major() >= 12 && transpose_ &&
-      bits_ == 4 &&
-      (mode_ == QuantizationMode::Mxfp4 ||
-       mode_ == QuantizationMode::Nvfp4) &&
-      w.ndim() == 2 && (N % 128 == 0) && (K % 64 == 0) &&
-      (x.dtype() == float16 || x.dtype() == bfloat16)) {
-    if (can_use_qmv && (M * B < 8)) {
-      call_qmv();
-    } else {
-      out.set_data(cu::malloc_async(out.nbytes(), encoder));
-      cute_qmm_fp4(x, w, scales, out, bits_, group_size_, encoder);
     }
     return;
   }
