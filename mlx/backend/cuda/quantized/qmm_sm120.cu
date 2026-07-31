@@ -84,7 +84,11 @@ template <
     int AlignA,
     int AlignB,
     typename TileShape,
-    typename KernelScheduleTag = cutlass::gemm::collective::KernelScheduleAuto>
+    typename KernelScheduleTag = cutlass::gemm::collective::KernelScheduleAuto,
+    // Output alignment in elements. The default enables the TMA epilogue and
+    // requires N % AlignOut == 0; AlignOut=1 selects a non-TMA epilogue that
+    // handles arbitrary N (used for shapes like DSv3-MLP N=1407).
+    int AlignOut = 128 / cutlass::sizeof_bits<ElementOut>::value>
 struct Sm120BlockScaledGemm {
   // Both A (activation) and B (weight) use the same block-scaled type.
   using ElementA = ElementQuant;
@@ -104,9 +108,8 @@ struct Sm120BlockScaledGemm {
   using ArchTag = cutlass::arch::Sm120;
   using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
 
-  static constexpr int AlignC =
-      128 / cutlass::sizeof_bits<ElementOut>::value;
-  static constexpr int AlignD = AlignC;
+  static constexpr int AlignC = AlignOut;
+  static constexpr int AlignD = AlignOut;
 
   // No multicast TMA on Desktop Blackwell/SM121 — cluster must be 1×1×1.
   using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
@@ -1129,6 +1132,53 @@ using MxFP4_FP16_Gemm_PP = Sm120BlockScaledGemm<
     cutlass::half_t, 32, 32, Sm120FP4TileShape,
     cutlass::gemm::KernelTmaWarpSpecializedPingpongMxf4Sm120>;
 
+// Unaligned-N variants: AlignOut=1 selects a non-TMA epilogue so the output
+// extent N needs no alignment (e.g. DSv3-MLP N=1407). The mainloop TMA path
+// is unchanged; only the store path is slightly slower, so these are used
+// exclusively when N % (16 / sizeof(out)) != 0.
+using NvFP4_BF16_Gemm_PP_U1 = Sm120BlockScaledGemm<
+    cutlass::nv_float4_t<cutlass::float_e2m1_t>,
+    cutlass::bfloat16_t, 32, 32, Sm120FP4TileShape,
+    cutlass::gemm::KernelTmaWarpSpecializedPingpongNvf4Sm120, 1>;
+using NvFP4_FP16_Gemm_PP_U1 = Sm120BlockScaledGemm<
+    cutlass::nv_float4_t<cutlass::float_e2m1_t>,
+    cutlass::half_t, 32, 32, Sm120FP4TileShape,
+    cutlass::gemm::KernelTmaWarpSpecializedPingpongNvf4Sm120, 1>;
+using MxFP4_BF16_Gemm_PP_U1 = Sm120BlockScaledGemm<
+    cutlass::mx_float4_t<cutlass::float_e2m1_t>,
+    cutlass::bfloat16_t, 32, 32, Sm120FP4TileShape,
+    cutlass::gemm::KernelTmaWarpSpecializedPingpongMxf4Sm120, 1>;
+using MxFP4_FP16_Gemm_PP_U1 = Sm120BlockScaledGemm<
+    cutlass::mx_float4_t<cutlass::float_e2m1_t>,
+    cutlass::half_t, 32, 32, Sm120FP4TileShape,
+    cutlass::gemm::KernelTmaWarpSpecializedPingpongMxf4Sm120, 1>;
+using MxFP8_BF16_Gemm_PP_U1 = Sm120BlockScaledGemm<
+    cutlass::mx_float8_t<cutlass::float_e4m3_t>,
+    cutlass::bfloat16_t, 16, 16, Sm120FP8TileShape,
+    cutlass::gemm::KernelTmaWarpSpecializedPingpongMxf8f6f4Sm120, 1>;
+using MxFP8_FP16_Gemm_PP_U1 = Sm120BlockScaledGemm<
+    cutlass::mx_float8_t<cutlass::float_e4m3_t>,
+    cutlass::half_t, 16, 16, Sm120FP8TileShape,
+    cutlass::gemm::KernelTmaWarpSpecializedPingpongMxf8f6f4Sm120, 1>;
+
+// Shared config helper for the unaligned variants.
+template <typename GemmTypeT>
+static void* get_configured_kernel_u1(const char* name) {
+  using GemmKernel = typename GemmTypeT::Gemm::GemmKernel;
+  void* ptr = (void*)sm120_gemm_kernel<GemmKernel>;
+  int smem = GemmKernel::SharedStorageSize;
+  if (smem >= (48 << 10)) {
+    cudaError_t err = cudaFuncSetAttribute(
+        ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(fmt::format(
+          "[qmm_sm120] cudaFuncSetAttribute failed for {}: {} (smem={}B)",
+          name, cudaGetErrorString(err), smem));
+    }
+  }
+  return ptr;
+}
+
 // NOTE: Tile shape sweep results (2025-03):
 // - 64×128×128: FAILS — CUTLASS TMA scale factor layout requires BM >= 128
 // - 128×64×128: FAILS — CUTLASS TMA scale factor layout requires BN >= 128
@@ -1349,16 +1399,33 @@ static void dispatch_sm120_fp4(
     cu::CommandEncoder& encoder) {
   const char* tag = "[qmm_fp4_sm120]";
 
+  // N-extent alignment decides between the TMA epilogue (aligned) and the
+  // AlignOut=1 non-TMA epilogue (arbitrary N).
+  bool n_aligned = (w.shape(-2) % (16 / size_of(out.dtype()))) == 0;
   if (group_size == 16) {
     // NVFP4: nv_float4_t with ue4m3 scale factors, SFVecSize=16.
     if (out.dtype() == bfloat16) {
-      void* kernel_ptr = get_configured_kernel_nvfp4_bf16_pp();
-      execute_sm120_fp4_gemm<NvFP4_BF16_Gemm_PP, __nv_bfloat16>(
-          kernel_ptr, x, w, scales, out, group_size, ldD, encoder);
+      if (n_aligned) {
+        void* kernel_ptr = get_configured_kernel_nvfp4_bf16_pp();
+        execute_sm120_fp4_gemm<NvFP4_BF16_Gemm_PP, __nv_bfloat16>(
+            kernel_ptr, x, w, scales, out, group_size, ldD, encoder);
+      } else {
+        void* kernel_ptr =
+            get_configured_kernel_u1<NvFP4_BF16_Gemm_PP_U1>("nvfp4_bf16_u1");
+        execute_sm120_fp4_gemm<NvFP4_BF16_Gemm_PP_U1, __nv_bfloat16>(
+            kernel_ptr, x, w, scales, out, group_size, ldD, encoder);
+      }
     } else if (out.dtype() == float16) {
-      void* kernel_ptr = get_configured_kernel_nvfp4_fp16_pp();
-      execute_sm120_fp4_gemm<NvFP4_FP16_Gemm_PP, __half>(
-          kernel_ptr, x, w, scales, out, group_size, ldD, encoder);
+      if (n_aligned) {
+        void* kernel_ptr = get_configured_kernel_nvfp4_fp16_pp();
+        execute_sm120_fp4_gemm<NvFP4_FP16_Gemm_PP, __half>(
+            kernel_ptr, x, w, scales, out, group_size, ldD, encoder);
+      } else {
+        void* kernel_ptr =
+            get_configured_kernel_u1<NvFP4_FP16_Gemm_PP_U1>("nvfp4_fp16_u1");
+        execute_sm120_fp4_gemm<NvFP4_FP16_Gemm_PP_U1, __half>(
+            kernel_ptr, x, w, scales, out, group_size, ldD, encoder);
+      }
     } else {
       throw std::runtime_error(
           fmt::format("{} Unsupported dtype for SM120 NVFP4 GEMM.", tag));
@@ -1366,13 +1433,27 @@ static void dispatch_sm120_fp4(
   } else if (group_size == 32) {
     // MXFP4: mx_float4_t with ue8m0 scale factors, SFVecSize=32.
     if (out.dtype() == bfloat16) {
-      void* kernel_ptr = get_configured_kernel_mxfp4_bf16_pp();
-      execute_sm120_fp4_gemm<MxFP4_BF16_Gemm_PP, __nv_bfloat16>(
-          kernel_ptr, x, w, scales, out, group_size, ldD, encoder);
+      if (n_aligned) {
+        void* kernel_ptr = get_configured_kernel_mxfp4_bf16_pp();
+        execute_sm120_fp4_gemm<MxFP4_BF16_Gemm_PP, __nv_bfloat16>(
+            kernel_ptr, x, w, scales, out, group_size, ldD, encoder);
+      } else {
+        void* kernel_ptr =
+            get_configured_kernel_u1<MxFP4_BF16_Gemm_PP_U1>("mxfp4_bf16_u1");
+        execute_sm120_fp4_gemm<MxFP4_BF16_Gemm_PP_U1, __nv_bfloat16>(
+            kernel_ptr, x, w, scales, out, group_size, ldD, encoder);
+      }
     } else if (out.dtype() == float16) {
-      void* kernel_ptr = get_configured_kernel_mxfp4_fp16_pp();
-      execute_sm120_fp4_gemm<MxFP4_FP16_Gemm_PP, __half>(
-          kernel_ptr, x, w, scales, out, group_size, ldD, encoder);
+      if (n_aligned) {
+        void* kernel_ptr = get_configured_kernel_mxfp4_fp16_pp();
+        execute_sm120_fp4_gemm<MxFP4_FP16_Gemm_PP, __half>(
+            kernel_ptr, x, w, scales, out, group_size, ldD, encoder);
+      } else {
+        void* kernel_ptr =
+            get_configured_kernel_u1<MxFP4_FP16_Gemm_PP_U1>("mxfp4_fp16_u1");
+        execute_sm120_fp4_gemm<MxFP4_FP16_Gemm_PP_U1, __half>(
+            kernel_ptr, x, w, scales, out, group_size, ldD, encoder);
+      }
     } else {
       throw std::runtime_error(
           fmt::format("{} Unsupported dtype for SM120 MXFP4 GEMM.", tag));
@@ -1408,40 +1489,11 @@ void cute_qmm_fp4_sm120(
   encoder.set_input_array(scales);
   encoder.set_output_array(out);
 
-  // The mainloop predicates partial N tiles natively, so weights and scales
-  // are used at their true N — no padded copies. Only the output TMA needs a
-  // 16-byte-aligned row stride: when N misses that (e.g. DSv3 N=1407), run
-  // the GEMM into a stride-padded buffer and extract the valid columns.
-  int align_d = 16 / size_of(out.dtype());
-  int ldD = (N + align_d - 1) / align_d * align_d;
-
-  if (ldD == N) {
-    dispatch_sm120_fp4(x, w, scales, out, group_size, N, encoder);
-    return;
-  }
-
-  auto& stream = encoder.stream();
-  array out_pad({M, ldD}, out.dtype(), nullptr, {});
-  out_pad.set_data(cu::malloc_async(out_pad.nbytes(), encoder));
-  encoder.add_temporary(out_pad);
-
-  dispatch_sm120_fp4(x, w, scales, out_pad, group_size, ldD, encoder);
-
-  // Extract first N columns from each row of the stride-padded output.
-  {
-    int threads = std::min(N, 256);
-    if (size_of(out.dtype()) == 2) {
-      extract_columns_kernel<__half><<<M, threads, 0, stream>>>(
-          reinterpret_cast<const __half*>(out_pad.data<void>()),
-          reinterpret_cast<__half*>(out.data<void>()),
-          M, N, ldD);
-    } else {
-      extract_columns_kernel<float><<<M, threads, 0, stream>>>(
-          reinterpret_cast<const float*>(out_pad.data<void>()),
-          reinterpret_cast<float*>(out.data<void>()),
-          M, N, ldD);
-    }
-  }
+  // The mainloop predicates partial N tiles and TMA zero-fills OOB weight
+  // rows, so the GEMM runs at the true N with no padded operand copies.
+  // Misaligned N selects the AlignOut=1 epilogue inside the dispatch, which
+  // writes the packed output directly — no padding, no column extraction.
+  dispatch_sm120_fp4(x, w, scales, out, group_size, N, encoder);
 }
 
 // ============================================================================
@@ -1464,14 +1516,29 @@ static void dispatch_sm120_fp8(
     cu::CommandEncoder& encoder) {
   const char* tag = "[qmm_fp8_sm120]";
 
+  bool n_aligned = (w.shape(-2) % (16 / size_of(out.dtype()))) == 0;
   if (out.dtype() == bfloat16) {
-    void* kernel_ptr = get_configured_kernel_mxfp8_bf16_pp();
-    execute_sm120_fp8_gemm<MxFP8_BF16_Gemm_PP, __nv_bfloat16>(
-        kernel_ptr, x, w, scales, out, group_size, ldD, encoder);
+    if (n_aligned) {
+      void* kernel_ptr = get_configured_kernel_mxfp8_bf16_pp();
+      execute_sm120_fp8_gemm<MxFP8_BF16_Gemm_PP, __nv_bfloat16>(
+          kernel_ptr, x, w, scales, out, group_size, ldD, encoder);
+    } else {
+      void* kernel_ptr =
+          get_configured_kernel_u1<MxFP8_BF16_Gemm_PP_U1>("mxfp8_bf16_u1");
+      execute_sm120_fp8_gemm<MxFP8_BF16_Gemm_PP_U1, __nv_bfloat16>(
+          kernel_ptr, x, w, scales, out, group_size, ldD, encoder);
+    }
   } else if (out.dtype() == float16) {
-    void* kernel_ptr = get_configured_kernel_mxfp8_fp16_pp();
-    execute_sm120_fp8_gemm<MxFP8_FP16_Gemm_PP, __half>(
-        kernel_ptr, x, w, scales, out, group_size, ldD, encoder);
+    if (n_aligned) {
+      void* kernel_ptr = get_configured_kernel_mxfp8_fp16_pp();
+      execute_sm120_fp8_gemm<MxFP8_FP16_Gemm_PP, __half>(
+          kernel_ptr, x, w, scales, out, group_size, ldD, encoder);
+    } else {
+      void* kernel_ptr =
+          get_configured_kernel_u1<MxFP8_FP16_Gemm_PP_U1>("mxfp8_fp16_u1");
+      execute_sm120_fp8_gemm<MxFP8_FP16_Gemm_PP_U1, __half>(
+          kernel_ptr, x, w, scales, out, group_size, ldD, encoder);
+    }
   } else {
     throw std::runtime_error(
         fmt::format("{} Unsupported dtype for SM120 MXFP8 GEMM.", tag));
@@ -1495,37 +1562,9 @@ void cute_qmm_fp8_sm120(
   encoder.set_input_array(scales);
   encoder.set_output_array(out);
 
-  // Same stride-padded output scheme as the FP4 wrapper: run at the true N,
-  // pad only the output row stride to 16-byte alignment when needed.
-  int align_d = 16 / size_of(out.dtype());
-  int ldD = (N + align_d - 1) / align_d * align_d;
-
-  if (ldD == N) {
-    dispatch_sm120_fp8(x, w, scales, out, group_size, N, encoder);
-    return;
-  }
-
-  auto& stream = encoder.stream();
-  array out_pad({M, ldD}, out.dtype(), nullptr, {});
-  out_pad.set_data(cu::malloc_async(out_pad.nbytes(), encoder));
-  encoder.add_temporary(out_pad);
-
-  dispatch_sm120_fp8(x, w, scales, out_pad, group_size, ldD, encoder);
-
-  {
-    int threads = std::min(N, 256);
-    if (size_of(out.dtype()) == 2) {
-      extract_columns_kernel<__half><<<M, threads, 0, stream>>>(
-          reinterpret_cast<const __half*>(out_pad.data<void>()),
-          reinterpret_cast<__half*>(out.data<void>()),
-          M, N, ldD);
-    } else {
-      extract_columns_kernel<float><<<M, threads, 0, stream>>>(
-          reinterpret_cast<const float*>(out_pad.data<void>()),
-          reinterpret_cast<float*>(out.data<void>()),
-          M, N, ldD);
-    }
-  }
+  // Same as the FP4 wrapper: true-N GEMM, AlignOut=1 epilogue for
+  // misaligned N, direct packed output.
+  dispatch_sm120_fp8(x, w, scales, out, group_size, N, encoder);
 }
 
 void clear_sm120_sf_cache() {
